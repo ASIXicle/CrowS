@@ -1,0 +1,141 @@
+#include "Piezo.h"
+#include <soc/rtc.h>
+
+#include "../Util/Timer.h"
+
+PiezoImpl Piezo;
+
+#ifdef CIRCUITOS_PIEZO_DAC_TIMER
+#define TIMER CIRCUITOS_PIEZO_DAC_TIMER
+#else
+#define TIMER 0
+#endif
+
+#ifdef CIRCUITOS_PIEZO_DAC_SD
+#define DAC_SD CIRCUITOS_PIEZO_DAC_SD
+#else
+#define DAC_SD 13
+#endif
+
+
+void PiezoImpl::begin(uint8_t pin){
+	this->pin = pin;
+
+	state = OFF;
+	pinMode(DAC_SD, OUTPUT);
+	digitalWrite(DAC_SD, HIGH);
+	dacWrite(pin, 127);
+
+	// Set up interrupt routine
+	// 20 kHz, 50 uS
+
+	if(timer != nullptr){
+		timerEnd(timer);
+		timer = nullptr;
+	}
+
+	timer = timerBegin(TIMER, 80, true);
+	timerAttachInterrupt(timer, &timerInterrupt, true);    // P3= edge triggered
+	dis(timer);
+
+	noTone();
+}
+
+void PiezoImpl::tone(uint16_t freq, uint16_t duration){
+	if(pin == (uint8_t) -1) return;
+	if(mute) return;
+	if(volume == 0) return;
+
+	currentFreq = freq;
+	currentDuration = duration;
+	counter = 0;
+
+	if(state == OFF){
+		dis(timer);
+		dacWrite(pin, 127);
+
+		state = POWERING;
+		digitalWrite(DAC_SD, LOW);
+
+		timerAlarmWrite(timer, ampBootTime * 1000, true);
+		timerAlarmEnable(timer);
+		timerStart(timer);
+	}else if(state == IDLE){
+		state = ON;
+		timerAlarmWrite(timer, 50, true);
+		timerWrite(timer, 0);
+	}
+}
+
+void PiezoImpl::noTone(){
+	if(pin == (uint8_t) -1) return;
+	if(state == IDLE) return;
+
+	dis(timer);
+	dacWrite(pin, 127);
+
+	if(state == ON || state == POWERING){
+		CM::timerAlarmWrite(timer, powerHold * 1000, true);
+		timerAlarmEnable(timer);
+		timerStart(timer);
+		state = IDLE;
+	}
+}
+
+void PiezoImpl::setMute(bool mute){
+	this->mute = mute;
+
+	if(mute){
+		this->noTone();
+	}
+}
+
+bool PiezoImpl::isMuted() const{
+	return mute;
+}
+
+void IRAM_ATTR PiezoImpl::timerInterrupt(){
+	PiezoImpl* piezo = &Piezo;
+
+	if(piezo->state == OFF || piezo->mute || piezo->volume == 0){
+		dis(piezo->timer);
+		//ets_printf("OUT\n");
+		return;
+	}else if(piezo->state == POWERING){
+		CM::timerAlarmWrite(piezo->timer, 50, true);
+		piezo->state = ON;
+		//ets_printf("POWERED\n");
+	}else if(piezo->state == IDLE){
+		dis(piezo->timer);
+		piezo->state = OFF;
+		digitalWrite(DAC_SD, HIGH);
+		//ets_printf("OFF\n");
+		return;
+	}
+
+	double value = sin((double) piezo->currentFreq * 2.0 * M_PI * ((double) piezo->counter / 20000.0)); // wave [-1, 1]
+	// value /= 3.0; // counter voltage amplification
+	// value /= 3.0; // make sure we don't draw too much current
+	value *= (double) piezo->volume / 255.0; // apply volume [-1, 1]
+	value = value / 2.0 + 0.5; // bring to [0, 1]
+	value *= 255.0; // bring to [0, 255]
+	value = value > 255 ? 255 : value; // clipping
+	value = value < 0 ? 0 : value; // clipping
+
+	dacWrite(piezo->pin, (uint8_t) value);
+	//ets_printf("%d\n", (uint8_t) value);
+
+	piezo->counter++;
+
+	if(piezo->currentDuration != 0 && piezo->counter * 50 >= piezo->currentDuration * 1000){
+		CM::timerAlarmWrite(piezo->timer, piezo->powerHold * 1000, true);
+		piezo->state = IDLE;
+
+		dacWrite(piezo->pin, 127);
+		piezo->currentFreq = 0;
+		piezo->currentDuration = 0;
+		piezo->counter = 0;
+
+		//ets_printf("DONE\n");
+	}
+}
