@@ -24,7 +24,7 @@
 #include <Preferences.h>
 #include <RadioLib.h>
 
-#define CROWS_VERSION "0.4.0"
+#define CROWS_VERSION "0.5.0"
 
 // ═══════════════════════════════════════════════════════════
 //  DISPLAY
@@ -87,6 +87,50 @@ bool needsRedraw = true;
 #define COL_BAT_LOW    TFT_YELLOW
 #define COL_BAT_CRIT   TFT_RED
 #define COL_ACCENT     COL_PURPLE
+#define COL_PANIC      TFT_RED
+
+// Runtime theme color — purple normally, red in Panic Mode
+uint16_t colTheme = COL_PURPLE;
+
+// ═══════════════════════════════════════════════════════════
+//  PANIC MODE
+// ═══════════════════════════════════════════════════════════
+bool panicActive       = false;  // local device broadcasting SOS
+bool panicAlert        = false;  // received SOS from another device
+char panicSender[16]   = {0};
+unsigned long panicActivateTime = 0;  // when panic was activated
+unsigned long panicLastTx       = 0;
+unsigned long panicDismissTime  = 0;  // cooldown after dismissing alert
+#define PANIC_BEACON_MS    3000       // broadcast interval
+#define PANIC_HOLD_MS      5000       // long-press duration to activate/deactivate
+#define PANIC_HINT_DELAY   600000UL   // 10 min before showing deactivation hint
+#define PANIC_ALERT_COOLDOWN 60000    // don't re-alert same sender for 60s
+
+// Hold detection for * (activate) and 9 (deactivate)
+unsigned long holdStart_star = 0;
+unsigned long holdStart_9    = 0;
+
+// Backlight PWM (GPIO 32, active-low: 0=bright, 255=off)
+#define BL_PIN       32
+#define BL_LEDC_CH    1   // channel 0 = buzzer
+
+void backlightInit() {
+  ledcSetup(BL_LEDC_CH, 5000, 8);
+  ledcAttachPin(BL_PIN, BL_LEDC_CH);
+  ledcWrite(BL_LEDC_CH, 0);   // full brightness
+}
+
+// Set brightness 0–100%. Active-low: 100%→duty 0, 0%→duty 255
+void backlightSet(uint8_t pct) {
+  if (pct > 100) pct = 100;
+  ledcWrite(BL_LEDC_CH, 255 - (255 * pct / 100));
+}
+
+// Forward declarations for panic functions
+void panicToggle();
+void panicSendBeacon();
+void panicDrawAlert();
+void panicDrawHoldProgress(int btnId);
 
 // ═══════════════════════════════════════════════════════════
 //  LoRa RADIO — LLCC68 via RadioLib on HSPI
@@ -215,6 +259,26 @@ bool loraReceive() {
 
   Serial.printf("[LoRa] RX: %s (RSSI %.1f, SNR %.1f)\n",
                 raw.c_str(), rxRSSI, rxSNR);
+
+  // ── PANIC beacon: "PANIC:username" ──
+  if (raw.startsWith("PANIC:")) {
+    String who = raw.substring(6);
+    if (who.length() > 0 && who.length() <= 15 && who.indexOf(':') < 0) {
+      bool isSelf = (strcmp(who.c_str(), userName) == 0)
+                 || (who.indexOf(userName) >= 0)
+                 || (String(userName).indexOf(who) >= 0);
+      if (!isSelf && !panicAlert) {
+        // Cooldown check: don't re-alert if recently dismissed
+        if (millis() - panicDismissTime >= PANIC_ALERT_COOLDOWN) {
+          panicAlert = true;
+          strncpy(panicSender, who.c_str(), sizeof(panicSender) - 1);
+          panicSender[sizeof(panicSender) - 1] = '\0';
+          Serial.printf("[PANIC] SOS from %s!\n", panicSender);
+        }
+      }
+    }
+    return false;
+  }
 
   // ── SHINE beacon: "SHINE:username" ──
   if (raw.startsWith("SHINE:")) {
@@ -1717,7 +1781,7 @@ void msg_drawInbox() {
   canvas->clear(COL_BG);
 
   // Header
-  canvas->fillRect(0, 0, SCREEN_W, 14, COL_PURPLE);
+  canvas->fillRect(0, 0, SCREEN_W, 14, colTheme);
   canvas->setTextSize(1);
   canvas->setTextColor(TFT_WHITE);
   canvas->setCursor(5, 3);
@@ -1749,7 +1813,7 @@ void msg_drawInbox() {
       int row_y = y + i * 30;
 
       // Sender label
-      canvas->setTextColor(m->outgoing ? COL_PURPLE : TFT_GREEN);
+      canvas->setTextColor(m->outgoing ? colTheme : TFT_GREEN);
       canvas->setCursor(4, row_y);
       if (m->outgoing) {
         canvas->print("You");
@@ -1795,7 +1859,7 @@ void msg_drawCompose() {
   canvas->clear(COL_BG);
 
   // Header
-  canvas->fillRect(0, 0, SCREEN_W, 14, COL_PURPLE);
+  canvas->fillRect(0, 0, SCREEN_W, 14, colTheme);
   canvas->setTextSize(1);
   canvas->setTextColor(TFT_WHITE);
   canvas->setCursor(5, 3);
@@ -2007,7 +2071,7 @@ void shine_draw() {
   canvas->clear(COL_BG);
 
   // Header
-  canvas->fillRect(0, 0, SCREEN_W, 14, COL_PURPLE);
+  canvas->fillRect(0, 0, SCREEN_W, 14, colTheme);
   canvas->setTextSize(1);
   canvas->setTextColor(TFT_WHITE);
   canvas->setCursor(5, 3);
@@ -2150,7 +2214,7 @@ void settings_draw() {
   canvas->clear(COL_BG);
 
   canvas->setTextSize(1);
-  canvas->setTextColor(COL_ACCENT);
+  canvas->setTextColor(colTheme);
   canvas->setCursor(4, 4);
   canvas->print("SETTINGS");
   canvas->fillRect(0, 14, SCREEN_W, 1, COL_DIVIDER);
@@ -2171,7 +2235,7 @@ void settings_draw() {
   canvas->setTextColor(COL_UNSEL);
   canvas->setCursor(labelX, y);
   canvas->print("Name");
-  canvas->setTextColor(COL_PURPLE);
+  canvas->setTextColor(colTheme);
   canvas->setCursor(valX, y);
   canvas->print(userName[0] ? userName : "(none)");
 
@@ -2301,7 +2365,7 @@ void drawWizard() {
   canvas->clear(COL_BG);
 
   // Header bar
-  canvas->fillRect(0, 0, SCREEN_W, 14, COL_PURPLE);
+  canvas->fillRect(0, 0, SCREEN_W, 14, colTheme);
   canvas->setTextSize(1);
   canvas->setTextColor(TFT_WHITE);
   canvas->setCursor(5, 3);
@@ -2381,6 +2445,104 @@ void wizardHandleButton(uint8_t btnId) {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  PANIC MODE FUNCTIONS
+// ═══════════════════════════════════════════════════════════
+
+void panicToggle() {
+  panicActive = !panicActive;
+  if (panicActive) {
+    colTheme = COL_PANIC;
+    backlightSet(75);
+    panicActivateTime = millis();
+    panicSendBeacon();               // immediate first broadcast
+    panicLastTx = millis();
+    Serial.println("[PANIC] === SOS ACTIVATED ===");
+  } else {
+    colTheme = COL_PURPLE;
+    backlightSet(100);
+    Serial.println("[PANIC] Deactivated");
+  }
+  needsRedraw = true;
+}
+
+void panicSendBeacon() {
+  if (!loraReady) return;
+  char pkt[32];
+  snprintf(pkt, sizeof(pkt), "PANIC:%s", userName);
+  radio->standby();
+  radio->transmit((uint8_t*)pkt, strlen(pkt));
+  radio->startReceive();
+  Serial.printf("[PANIC] TX: %s\n", pkt);
+}
+
+void panicDrawAlert() {
+  canvas->clear(COL_BG);
+
+  // Red border (3px)
+  for (int i = 0; i < 3; i++)
+    canvas->drawRect(i, i, SCREEN_W - 2*i, SCREEN_H - 2*i, COL_PANIC);
+
+  // Central alert box
+  int bx = 10, by = 25, bw = 140, bh = 78;
+  canvas->fillRect(bx, by, bw, bh, COL_BG);
+  canvas->drawRect(bx, by, bw, bh, COL_PANIC);
+  canvas->drawRect(bx+1, by+1, bw-2, bh-2, COL_PANIC);
+
+  // "!! SOS !!" header
+  canvas->setTextSize(2);
+  canvas->setTextColor(COL_PANIC);
+  canvas->setCursor(32, by + 8);
+  canvas->print("!! SOS !!");
+
+  // Sender name
+  canvas->setTextSize(1);
+  canvas->setTextColor(TFT_WHITE);
+  canvas->setCursor(bx + 6, by + 32);
+  canvas->print("FROM:");
+  canvas->setTextColor(COL_PANIC);
+  canvas->setCursor(bx + 42, by + 32);
+  canvas->print(panicSender);
+
+  // Dismiss hint
+  canvas->setTextColor(COL_HINT);
+  canvas->setCursor(bx + 6, by + 50);
+  canvas->print("Press any key...");
+
+  // Flashing indicator — alternate every 500ms
+  if ((millis() / 500) % 2 == 0) {
+    canvas->fillRect(bx + 2, by + 2, bw - 4, 4, COL_PANIC);
+    canvas->fillRect(bx + 2, by + bh - 6, bw - 4, 4, COL_PANIC);
+  }
+}
+
+// Draw a hold-progress bar at the bottom of screen
+void panicDrawHoldProgress(int btnId) {
+  unsigned long elapsed = 0;
+  if (btnId == BTN_STAR && holdStart_star > 0)
+    elapsed = millis() - holdStart_star;
+  else if (btnId == BTN_9 && holdStart_9 > 0)
+    elapsed = millis() - holdStart_9;
+
+  if (elapsed == 0) return;
+
+  int barW = (int)((elapsed * (SCREEN_W - 20)) / PANIC_HOLD_MS);
+  if (barW > SCREEN_W - 20) barW = SCREEN_W - 20;
+
+  uint16_t col = (btnId == BTN_STAR) ? COL_PANIC : COL_PURPLE;
+  canvas->fillRect(10, SCREEN_H - 8, SCREEN_W - 20, 5, COL_DIVIDER);
+  canvas->fillRect(10, SCREEN_H - 8, barW, 5, col);
+
+  // Label
+  canvas->setTextSize(1);
+  canvas->setTextColor(col);
+  canvas->setCursor(10, SCREEN_H - 18);
+  if (btnId == BTN_STAR)
+    canvas->print("Hold * to PANIC...");
+  else
+    canvas->print("Hold 9 to cancel...");
+}
+
+// ═══════════════════════════════════════════════════════════
 //  MENU DRAWING
 // ═══════════════════════════════════════════════════════════
 #define STATUS_H    12
@@ -2395,7 +2557,7 @@ void drawStatusBar() {
 
   // Name (top-left, purple)
   if (userName[0]) {
-    canvas->setTextColor(COL_PURPLE);
+    canvas->setTextColor(colTheme);
     canvas->setCursor(2, 2);
     canvas->print(userName);
   }
@@ -2418,7 +2580,7 @@ void drawMenu() {
   drawStatusBar();
 
   canvas->setTextSize(2);
-  canvas->setTextColor(COL_TITLE);
+  canvas->setTextColor(colTheme);
   canvas->setCursor(50, TITLE_Y);
   canvas->print("CrowS");
 
@@ -2431,7 +2593,8 @@ void drawMenu() {
       int idx = catScroll + i;
       int y = MENU_TOP + i * MENU_ITEM_H;
       if (idx == catSel) {
-        canvas->fillRect(MENU_PAD_X, y, SCREEN_W - MENU_PAD_X * 2, MENU_ITEM_H - 2, categories[idx].color);
+        uint16_t hlCol = panicActive ? COL_PANIC : categories[idx].color;
+        canvas->fillRect(MENU_PAD_X, y, SCREEN_W - MENU_PAD_X * 2, MENU_ITEM_H - 2, hlCol);
         canvas->setTextColor(COL_SEL_TEXT);
       } else {
         canvas->setTextColor(COL_UNSEL);
@@ -2472,7 +2635,8 @@ void drawMenu() {
       int idx = menuScroll + i;
       int y = MENU_TOP + i * MENU_ITEM_H;
       if (idx == menuSel) {
-        canvas->fillRect(MENU_PAD_X, y, SCREEN_W - MENU_PAD_X * 2, MENU_ITEM_H - 2, cat->apps[idx].color);
+        uint16_t hlCol = panicActive ? COL_PANIC : cat->apps[idx].color;
+        canvas->fillRect(MENU_PAD_X, y, SCREEN_W - MENU_PAD_X * 2, MENU_ITEM_H - 2, hlCol);
         canvas->setTextColor(COL_SEL_TEXT);
       } else {
         canvas->setTextColor(COL_UNSEL);
@@ -2531,6 +2695,7 @@ void setup() {
   Chatter.begin();
   buzzerInit();
   loraInit();
+  backlightInit();   // PWM backlight on GPIO 32 (overrides Chatter's digitalWrite)
 
   display = Chatter.getDisplay();
   canvas  = display->getBaseSprite();
@@ -2563,14 +2728,91 @@ void setup() {
 void loop() {
   LoopManager::loop();
 
+  // ── Panic alert overlay: takes over the entire screen ──
+  if (panicAlert) {
+    panicDrawAlert();
+    needsRedraw = true;
+
+    // Siren: alternating tones ~200ms cycle
+    if ((millis() / 200) % 2 == 0)
+      ledcWriteTone(0, 800);
+    else
+      ledcWriteTone(0, 1200);
+
+    // Any button press dismisses
+    if (millis() - lastPoll >= POLL_MS) {
+      lastPoll = millis();
+      uint16_t cur = readButtons();
+      uint16_t pressed = prevButtons & ~cur;
+      prevButtons = cur;
+      if (pressed) {
+        panicAlert = false;
+        panicDismissTime = millis();
+        ledcWriteTone(0, 0);
+        Serial.printf("[PANIC] Alert from %s dismissed\n", panicSender);
+        // Redraw whatever was on screen
+        if (osState == STATE_MENU) drawMenu();
+        else if (osState == STATE_APP && activeApp) { activeApp->onStart(); }
+        needsRedraw = true;
+      }
+    }
+
+    if (needsRedraw) { display->commit(); needsRedraw = false; }
+    return;  // skip everything else while alert is showing
+  }
+
   if (millis() - lastPoll >= POLL_MS) {
     lastPoll = millis();
     uint16_t cur = readButtons();
     uint16_t pressed = prevButtons & ~cur;
     prevButtons = cur;
 
+    // ── Hold detection for Panic Mode ──
+    // BTN_STAR (bit 7): hold 5s to ACTIVATE panic
+    bool starHeld = !(cur & (1 << BTN_STAR));  // active-low
+    if (starHeld && !panicActive) {
+      if (holdStart_star == 0) holdStart_star = millis();
+      if (millis() - holdStart_star >= PANIC_HOLD_MS) {
+        panicToggle();
+        holdStart_star = 0;
+        // Redraw current screen with new theme
+        if (osState == STATE_MENU) drawMenu();
+      }
+    } else {
+      if (holdStart_star > 0 && !panicActive) {
+        // Released early — clear progress bar
+        holdStart_star = 0;
+        if (osState == STATE_MENU) drawMenu();
+        else needsRedraw = true;
+      }
+      holdStart_star = 0;
+    }
+
+    // BTN_9 (bit 14): hold 5s to DEACTIVATE panic
+    bool nineHeld = !(cur & (1 << BTN_9));
+    if (nineHeld && panicActive) {
+      if (holdStart_9 == 0) holdStart_9 = millis();
+      if (millis() - holdStart_9 >= PANIC_HOLD_MS) {
+        panicToggle();
+        holdStart_9 = 0;
+        if (osState == STATE_MENU) drawMenu();
+      }
+    } else {
+      if (holdStart_9 > 0 && panicActive) {
+        holdStart_9 = 0;
+        if (osState == STATE_MENU) drawMenu();
+        else needsRedraw = true;
+      }
+      holdStart_9 = 0;
+    }
+
+    // ── Edge-triggered button handling ──
     for (int i = 0; i < 16; i++) {
       if (!(pressed & (1 << i))) continue;
+
+      // Suppress edge events for keys being held for panic
+      if (i == BTN_STAR && holdStart_star > 0) continue;
+      if (i == BTN_9    && holdStart_9 > 0)    continue;
 
       if (osState == STATE_MENU) {
         if (menuLevel == 0) {
@@ -2660,6 +2902,28 @@ void loop() {
       shineLastTx = now;
       shineSendBeacon();
     }
+  }
+
+  // ── Panic beacon broadcast (while active) ──
+  if (panicActive && loraReady) {
+    unsigned long now = millis();
+    if (now - panicLastTx >= PANIC_BEACON_MS) {
+      panicLastTx = now;
+      panicSendBeacon();
+    }
+  }
+
+  // ── Hold progress bar overlay ──
+  if (holdStart_star > 0 && !panicActive) {
+    panicDrawHoldProgress(BTN_STAR);
+    needsRedraw = true;
+  }
+  if (holdStart_9 > 0 && panicActive) {
+    // Only show deactivation progress after 10-minute delay
+    if (millis() - panicActivateTime >= PANIC_HINT_DELAY) {
+      panicDrawHoldProgress(BTN_9);
+    }
+    needsRedraw = true;
   }
 
   if (needsRedraw) {
