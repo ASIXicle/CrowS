@@ -1,0 +1,214 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index a86f78f..b2ffea8 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * CrowS — Chatter Redesigned OS with Substance
+- * v0.3.0: Matrix splash, ChatterTris integration, battery fix
++ * v0.3.2: Feather boot splash, matrix rain removed
+  *
+  * Target:  CircuitMess Chatter 2.0
+  *          ESP32-D0WD, ST7735S 160x128 TFT, 74HC165 shift register input
+@@ -244,114 +244,96 @@ int getBatteryMV() {
+ }
+ 
+ // ═══════════════════════════════════════════════════════════
+-//  MATRIX RAIN — boot splash animation
++//  FEATHER BOOT SPLASH — progressive purple fill animation
+ // ═══════════════════════════════════════════════════════════
+ /*
+- * Falling green characters, Matrix-style. Each of the 26 columns
+- * has a stream with a bright head and fading trail. Characters
+- * mutate randomly. "CrowS" fades in over the final second.
+- * Runs ~3s blocking in setup(), then hands off to the menu.
++ * Hand-drawn pixel art crow feather (24×25 at 4× scale = 96×100).
++ * Starts as dark silhouette, fills bottom-to-top with purple.
++ * "CrowS" fades in after fill completes. Runs ~2.5s blocking.
+  */
+ 
+-#define MATRIX_COLS      26    // 160 / 6
+-#define MATRIX_ROWS      16   // 128 / 8
+-#define MATRIX_FRAMES    80   // ~3.2s at 40ms/frame
+-#define MATRIX_FRAME_MS  40
+-#define MATRIX_TRAIL      5
+-
+-#define MATRIX_HEAD  0xFFFF   // white
+-#define MATRIX_G1    0x07E0   // bright green
+-#define MATRIX_G2    0x0600   // medium green
+-#define MATRIX_G3    0x0380   // dim green
+-#define MATRIX_G4    0x01C0   // very dim green
+-
+-void matrixSplash() {
+-  int16_t headY[MATRIX_COLS];
+-  int8_t  speed[MATRIX_COLS];
+-  int8_t  startDelay[MATRIX_COLS];
+-  char    grid[MATRIX_ROWS][MATRIX_COLS];
+-
+-  for (int c = 0; c < MATRIX_COLS; c++) {
+-    headY[c] = -1;
+-    speed[c] = 1 + random(3);
+-    startDelay[c] = random(20);
+-    for (int r = 0; r < MATRIX_ROWS; r++) {
+-      grid[r][c] = 33 + random(94);
+-    }
+-  }
+-
+-  canvas->setTextSize(1);
+-
+-  for (int frame = 0; frame < MATRIX_FRAMES; frame++) {
+-    canvas->clear(COL_BG);
+-
+-    for (int c = 0; c < MATRIX_COLS; c++) {
+-      if (startDelay[c] > 0) {
+-        startDelay[c]--;
+-        continue;
+-      }
+-
+-      headY[c] += speed[c];
+-
+-      if (headY[c] - MATRIX_TRAIL > MATRIX_ROWS) {
+-        headY[c] = -1;
+-        speed[c] = 1 + random(3);
+-        startDelay[c] = random(10);
+-        for (int r = 0; r < MATRIX_ROWS; r++) {
+-          grid[r][c] = 33 + random(94);
+-        }
+-        continue;
+-      }
++// Feather bitmap: 24×25, 3 bytes/row (MSB-left), 75 bytes total
++#define FEATHER_W      24
++#define FEATHER_H      25
++#define FEATHER_SCALE   4    // each art pixel = 4×4 display pixels
++#define FEATHER_OX     32    // (160 - 96) / 2
++#define FEATHER_OY      2    // top margin
++#define FEATHER_FILL_MS  60  // ms per fill row
++#define FEATHER_HOLD_MS  60  // ms per text-fade frame
++
++#define COL_SILHOUETTE 0x2945  // dark gray outline before fill
++
++static const uint8_t FEATHER_BITMAP[FEATHER_H * 3] PROGMEM = {
++  0x00, 0x00, 0x10,  // row 0
++  0x00, 0x00, 0x1C,  // row 1
++  0x00, 0x00, 0x5E,  // row 2
++  0x00, 0x00, 0xDF,  // row 3
++  0x00, 0x00, 0xFF,  // row 4
++  0x00, 0x02, 0xF8,  // row 5
++  0x00, 0x06, 0xFF,  // row 6
++  0x00, 0x17, 0xFE,  // row 7
++  0x00, 0x3F, 0x80,  // row 8
++  0x00, 0x7F, 0xF8,  // row 9
++  0x01, 0x7F, 0xF0,  // row 10
++  0x03, 0x78, 0x00,  // row 11
++  0x07, 0x7F, 0xC0,  // row 12
++  0x03, 0xFE, 0x00,  // row 13
++  0x0B, 0xE0, 0x00,  // row 14
++  0x0F, 0xFE, 0x00,  // row 15
++  0x0B, 0x80, 0x00,  // row 16
++  0x05, 0xE0, 0x00,  // row 17
++  0x09, 0xC0, 0x00,  // row 18
++  0x11, 0x00, 0x00,  // row 19
++  0x20, 0x00, 0x00,  // row 20
++  0x40, 0x00, 0x00,  // row 21
++  0x40, 0x00, 0x00,  // row 22
++  0x80, 0x00, 0x00,  // row 23
++  0x80, 0x00, 0x00,  // row 24
++};
+ 
+-      // Mutate a random trail character occasionally
+-      if (random(4) == 0) {
+-        int mutRow = headY[c] - random(MATRIX_TRAIL);
+-        if (mutRow >= 0 && mutRow < MATRIX_ROWS) {
+-          grid[mutRow][c] = 33 + random(94);
+-        }
+-      }
++static inline bool featherPixel(int r, int c) {
++  if (r < 0 || r >= FEATHER_H || c < 0 || c >= FEATHER_W) return false;
++  uint8_t byte = pgm_read_byte(&FEATHER_BITMAP[r * 3 + (c >> 3)]);
++  return byte & (0x80 >> (c & 7));
++}
+ 
+-      // Draw the trail
+-      for (int t = 0; t <= MATRIX_TRAIL; t++) {
+-        int r = headY[c] - t;
+-        if (r < 0 || r >= MATRIX_ROWS) continue;
+-
+-        uint16_t color;
+-        if (t == 0)      color = MATRIX_HEAD;
+-        else if (t == 1) color = MATRIX_G1;
+-        else if (t == 2) color = MATRIX_G2;
+-        else if (t == 3) color = MATRIX_G3;
+-        else             color = MATRIX_G4;
+-
+-        canvas->setTextColor(color);
+-        canvas->setCursor(c * 6, r * 8);
+-        canvas->print(grid[r][c]);
+-      }
++static void drawFeather(int fillUpToRow) {
++  // fillUpToRow: rows >= this value are filled purple, rest silhouette
++  // (bottom-to-top fill, so row 24 fills first)
++  for (int r = 0; r < FEATHER_H; r++) {
++    for (int c = 0; c < FEATHER_W; c++) {
++      if (!featherPixel(r, c)) continue;
++      uint16_t color = (r >= fillUpToRow) ? COL_PURPLE : COL_SILHOUETTE;
++      int px = FEATHER_OX + c * FEATHER_SCALE;
++      int py = FEATHER_OY + r * FEATHER_SCALE;
++      canvas->fillRect(px, py, FEATHER_SCALE, FEATHER_SCALE, color);
+     }
++  }
++}
+ 
+-    // Overlay title during last 30 frames (~1.2s)
+-    if (frame >= MATRIX_FRAMES - 30) {
+-      int fadeFrame = frame - (MATRIX_FRAMES - 30);
+-
+-      uint16_t titleCol;
+-      if (fadeFrame < 10)      titleCol = MATRIX_G3;
+-      else if (fadeFrame < 20) titleCol = MATRIX_G1;
+-      else                     titleCol = TFT_CYAN;
++void featherSplash() {
++  // Phase 1: silhouette appears instantly, then fills bottom-to-top
++  for (int fillRow = FEATHER_H; fillRow >= 0; fillRow--) {
++    canvas->clear(COL_BG);
++    drawFeather(fillRow);
++    display->commit();
++    delay(FEATHER_FILL_MS);
++  }
+ 
+-      canvas->setTextSize(2);
+-      canvas->setTextColor(titleCol);
+-      canvas->setCursor(50, 48);
+-      canvas->print("CrowS");
++  // Phase 2: "CrowS" fades in below the feather (15 frames)
++  uint16_t fadeCols[] = { COL_SILHOUETTE, 0x590F, COL_PURPLE };
++  for (int f = 0; f < 15; f++) {
++    canvas->clear(COL_BG);
++    drawFeather(0);  // full purple feather
+ 
+-      if (fadeFrame > 10) {
+-        canvas->setTextSize(1);
+-        canvas->setTextColor(fadeFrame > 20 ? COL_HINT : MATRIX_G4);
+-        canvas->setCursor(17, 70);
+-      }
+-    }
++    int ci = (f < 5) ? 0 : (f < 10) ? 1 : 2;
++    canvas->setTextSize(2);
++    canvas->setTextColor(fadeCols[ci]);
++    canvas->setCursor(50, 108);
++    canvas->print("CrowS");
+ 
+     display->commit();
+-    delay(MATRIX_FRAME_MS);
++    delay(FEATHER_HOLD_MS);
+   }
+ }
+ 
+@@ -1799,7 +1781,7 @@ void setup() {
+   digitalWrite(SR_LOAD, HIGH);
+   digitalWrite(SR_CLK, LOW);
+ 
+-  matrixSplash();
++  featherSplash();
+ 
+   // Check for saved name — first run goes to wizard
+   if (identityExists()) {
