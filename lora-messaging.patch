@@ -1,0 +1,500 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index b4a0fef..9510353 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * CrowS — Chatter Redesigned OS with Substance
+- * v0.3.2: Feather boot splash, matrix rain removed
++ * v0.4.0: LoRa messaging (LLCC68, 868 MHz, RadioLib)
+  *
+  * Target:  CircuitMess Chatter 2.0
+  *          ESP32-D0WD, ST7735S 160x128 TFT, 74HC165 shift register input
+@@ -22,8 +22,9 @@
+ #include <Chatter.h>
+ #include <Loop/LoopManager.h>
+ #include <Preferences.h>
++#include <RadioLib.h>
+ 
+-#define CROWS_VERSION "0.3.2"
++#define CROWS_VERSION "0.4.0"
+ 
+ // ═══════════════════════════════════════════════════════════
+ //  DISPLAY
+@@ -87,6 +88,145 @@ bool needsRedraw = true;
+ #define COL_BAT_CRIT   TFT_RED
+ #define COL_ACCENT     COL_PURPLE
+ 
++// ═══════════════════════════════════════════════════════════
++//  LoRa RADIO — LLCC68 via RadioLib on HSPI
++// ═══════════════════════════════════════════════════════════
++/*
++ * Pins from Chatter-Library Pins.hpp + schematic (confirmed).
++ * VGdd79S868N0S1 module — 868 MHz ISM band.
++ * HSPI is already initialized by Chatter.begin(); we grab the
++ * reference via Chatter.getSPILoRa().
++ * RST is not wired (hardwired high on PCB) — pass -1 to RadioLib.
++ */
++#define LORA_CS    14
++#define LORA_DIO1  18
++#define LORA_RST   -1
++#define LORA_BUSY   4
++
++// Radio instance (initialized in setup)
++LLCC68*  radio = nullptr;
++Module*  radioMod = nullptr;
++bool     loraReady = false;
++
++// Interrupt flag — set by ISR on DIO1, cleared in loop()
++volatile bool loraRxFlag = false;
++void IRAM_ATTR loraOnDio1() { loraRxFlag = true; }
++
++// ── Message storage ──
++#define MSG_MAX        20
++#define MSG_TEXT_LEN   64
++#define MSG_NAME_LEN   16
++#define MSG_PROTO      "CROWS"   // protocol prefix
++
++struct CrowSMsg {
++  char sender[MSG_NAME_LEN];
++  char text[MSG_TEXT_LEN];
++  bool outgoing;     // true = we sent it
++};
++
++CrowSMsg  msgInbox[MSG_MAX];
++int       msgCount = 0;        // total stored (0..MSG_MAX)
++
++// Push a message into the inbox (drops oldest if full)
++void msgPush(const char* sender, const char* text, bool outgoing) {
++  if (msgCount >= MSG_MAX) {
++    // Shift everything down — drop oldest at index 0
++    memmove(&msgInbox[0], &msgInbox[1], sizeof(CrowSMsg) * (MSG_MAX - 1));
++    msgCount = MSG_MAX - 1;
++  }
++  CrowSMsg* m = &msgInbox[msgCount];
++  strncpy(m->sender, sender, MSG_NAME_LEN - 1);
++  m->sender[MSG_NAME_LEN - 1] = '\0';
++  strncpy(m->text, text, MSG_TEXT_LEN - 1);
++  m->text[MSG_TEXT_LEN - 1] = '\0';
++  m->outgoing = outgoing;
++  msgCount++;
++}
++
++// ── Radio init ──
++void loraInit() {
++  SPIClass& spi = Chatter.getSPILoRa();
++  radioMod = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, spi);
++  radio = new LLCC68(radioMod);
++
++  // 868 MHz, 125 kHz BW, SF9, CR 4/7, private sync, 10 dBm, 8-sym preamble
++  // tcxoVoltage=1.6V, DC-DC regulator (not LDO)
++  int16_t state = radio->begin(868.0, 125.0, 9, 7,
++                                RADIOLIB_SX126X_SYNC_WORD_PRIVATE,
++                                10, 8, 1.6, false);
++  if (state == RADIOLIB_ERR_NONE) {
++    radio->setDio1Action(loraOnDio1);
++    radio->startReceive();
++    loraReady = true;
++    Serial.println("[LoRa] init OK — 868 MHz, SF9, 125 kHz");
++  } else {
++    Serial.printf("[LoRa] init FAILED (code %d)\n", state);
++  }
++}
++
++// ── Transmit a message ──
++// (userName is defined later in the IDENTITY section)
++extern char userName[16];
++
++bool loraSend(const char* text) {
++  if (!loraReady || !text[0]) return false;
++
++  // Build packet: CROWS:username:text
++  char packet[128];
++  snprintf(packet, sizeof(packet), "%s:%s:%s", MSG_PROTO, userName, text);
++
++  // Must stop receiving to transmit
++  radio->standby();
++  int16_t state = radio->transmit((uint8_t*)packet, strlen(packet));
++
++  // Always restart receive after transmit
++  radio->startReceive();
++
++  if (state == RADIOLIB_ERR_NONE) {
++    Serial.printf("[LoRa] TX OK: %s\n", packet);
++    return true;
++  } else {
++    Serial.printf("[LoRa] TX FAIL (code %d)\n", state);
++    return false;
++  }
++}
++
++// ── Process received packet (called from loop) ──
++// Returns true if a valid CrowS message was received
++bool loraReceive() {
++  if (!loraReady || !loraRxFlag) return false;
++  loraRxFlag = false;
++
++  String raw;
++  int16_t state = radio->readData(raw);
++  radio->startReceive();  // always restart
++
++  if (state != RADIOLIB_ERR_NONE) {
++    Serial.printf("[LoRa] RX error (code %d)\n", state);
++    return false;
++  }
++
++  Serial.printf("[LoRa] RX: %s (RSSI %.1f, SNR %.1f)\n",
++                raw.c_str(), radio->getRSSI(), radio->getSNR());
++
++  // Parse: CROWS:sender:text
++  if (!raw.startsWith(MSG_PROTO ":")) return false;
++
++  int nameStart = strlen(MSG_PROTO) + 1;  // skip "CROWS:"
++  int nameEnd = raw.indexOf(':', nameStart);
++  if (nameEnd < 0 || nameEnd == nameStart) return false;
++
++  String sender = raw.substring(nameStart, nameEnd);
++  String text   = raw.substring(nameEnd + 1);
++  if (text.length() == 0) return false;
++
++  // Don't store our own messages (if we hear our own TX echo)
++  if (strcmp(sender.c_str(), userName) == 0) return false;
++
++  msgPush(sender.c_str(), text.c_str(), false);
++  return true;
++}
++
+ // ═══════════════════════════════════════════════════════════
+ //  INPUT
+ // ═══════════════════════════════════════════════════════════
+@@ -1382,29 +1522,279 @@ void magOnStop() {
+ }
+ 
+ // ═══════════════════════════════════════════════════════════
+-//  APP: Messages (placeholder — Phase 4)
++//  APP: Messages — LoRa send/receive via LLCC68
+ // ═══════════════════════════════════════════════════════════
+-void msg_start() {
++/*
++ * Two views:
++ *   INBOX   — scrollable list of received + sent messages
++ *   COMPOSE — T9 text input, ENTER to send
++ *
++ * BACK in compose = backspace (or return to inbox if empty)
++ * BACK in inbox   = exit to menu
++ *
++ * Background receive runs in loop() regardless of active app.
++ */
++
++enum MsgView { MSG_INBOX, MSG_COMPOSE };
++MsgView  msgView = MSG_INBOX;
++int      msgScroll = 0;       // inbox scroll position (index of topmost visible msg)
++#define  MSG_VISIBLE 5        // lines visible in inbox (128 - header) / ~20px
++
++// Compose buffer (separate from wizard)
++char msgComposeBuf[MSG_TEXT_LEN] = {0};
++int  msgComposeCursor = 0;
++
++// ── Inbox drawing ──
++void msg_drawInbox() {
+   canvas->clear(COL_BG);
+-  canvas->setTextSize(2);
+-  canvas->setTextColor(TFT_GREEN);
+-  canvas->setCursor(14, 30);
+-  canvas->print("MESSAGE");
++
++  // Header
++  canvas->fillRect(0, 0, SCREEN_W, 14, COL_PURPLE);
++  canvas->setTextSize(1);
++  canvas->setTextColor(TFT_WHITE);
++  canvas->setCursor(5, 3);
++  canvas->print("MESSAGES");
++
++  // LoRa status indicator (top-right of header)
++  canvas->setTextColor(loraReady ? TFT_GREEN : TFT_RED);
++  canvas->setCursor(SCREEN_W - 18, 3);
++  canvas->print(loraReady ? "ON" : "!!");
++
++  if (msgCount == 0) {
++    canvas->setTextColor(COL_HINT);
++    canvas->setCursor(20, 50);
++    canvas->print("No messages yet");
++    canvas->setCursor(12, 66);
++    canvas->print("ENTER to compose");
++  } else {
++    // Clamp scroll
++    if (msgScroll > msgCount - 1) msgScroll = msgCount - 1;
++    if (msgScroll < 0) msgScroll = 0;
++    // Auto-scroll to bottom (newest) when at or near end
++    if (msgCount > MSG_VISIBLE && msgScroll < msgCount - MSG_VISIBLE) {
++      // Don't force — user may have scrolled up
++    }
++
++    int y = 18;
++    for (int i = 0; i < MSG_VISIBLE && (msgScroll + i) < msgCount; i++) {
++      CrowSMsg* m = &msgInbox[msgScroll + i];
++      int row_y = y + i * 20;
++
++      // Sender label
++      canvas->setTextColor(m->outgoing ? COL_PURPLE : TFT_GREEN);
++      canvas->setCursor(4, row_y);
++      if (m->outgoing) {
++        canvas->print("You");
++      } else {
++        // Truncate sender to 8 chars for display
++        char senderBuf[9];
++        strncpy(senderBuf, m->sender, 8);
++        senderBuf[8] = '\0';
++        canvas->print(senderBuf);
++      }
++
++      // Message text (truncated to fit)
++      canvas->setTextColor(TFT_WHITE);
++      canvas->setCursor(4, row_y + 10);
++      // Max ~26 chars at 6px wide = 156px
++      char dispText[27];
++      strncpy(dispText, m->text, 26);
++      dispText[26] = '\0';
++      canvas->print(dispText);
++    }
++
++    // Scroll indicators
++    canvas->setTextColor(COL_HINT);
++    if (msgScroll > 0) {
++      canvas->setCursor(150, 18);
++      canvas->print("^");
++    }
++    if (msgScroll + MSG_VISIBLE < msgCount) {
++      canvas->setCursor(150, 18 + (MSG_VISIBLE - 1) * 20);
++      canvas->print("v");
++    }
++  }
++
++  // Bottom hint
++  canvas->setTextColor(COL_HINT);
++  canvas->setCursor(8, 120);
++  canvas->print("ENTER:compose  BACK:exit");
++
++  needsRedraw = true;
++}
++
++// ── Compose drawing ──
++void msg_drawCompose() {
++  canvas->clear(COL_BG);
++
++  // Header
++  canvas->fillRect(0, 0, SCREEN_W, 14, COL_PURPLE);
+   canvas->setTextSize(1);
+   canvas->setTextColor(TFT_WHITE);
+-  canvas->setCursor(20, 60);
+-  canvas->print("LoRa encrypted msg");
+-  canvas->setCursor(20, 75);
+-  canvas->print("Coming in Phase 4!");
++  canvas->setCursor(5, 3);
++  canvas->print("COMPOSE");
++
++  // Character count
++  char countBuf[8];
++  snprintf(countBuf, sizeof(countBuf), "%d/%d", msgComposeCursor, MSG_TEXT_LEN - 1);
++  int countW = strlen(countBuf) * 6;
++  canvas->setTextColor(COL_HINT);
++  canvas->setCursor(SCREEN_W - countW - 4, 3);
++  canvas->print(countBuf);
++
++  // Input area — multi-line display
++  canvas->drawRect(4, 20, SCREEN_W - 8, 60, COL_HINT);
++  canvas->setTextColor(TFT_WHITE);
++  canvas->setTextSize(1);
++
++  // Word-wrap the compose buffer into the box
++  // 24 chars per line at 6px, 5 lines visible
++  int x = 8, y_line = 24;
++  for (int i = 0; i < msgComposeCursor && y_line < 74; i++) {
++    if (x >= SCREEN_W - 14) {
++      x = 8;
++      y_line += 10;
++    }
++    canvas->setCursor(x, y_line);
++    canvas->print(msgComposeBuf[i]);
++    x += 6;
++  }
++  // Blinking cursor
++  if ((millis() / 500) % 2) {
++    canvas->setCursor(x, y_line);
++    canvas->print("_");
++  }
++
++  // Help text
++  canvas->setTextSize(1);
+   canvas->setTextColor(COL_HINT);
+-  canvas->setCursor(40, 100);
+-  canvas->print("X to return");
++  canvas->setCursor(8, 86);
++  canvas->print("0-9:type  BACK:del");
++  canvas->setCursor(8, 98);
++  canvas->print("ENTER:send  #:cancel");
++
+   needsRedraw = true;
+ }
+-void msg_tick() { }
+-void msg_button(uint8_t id) { }
+-bool msg_back() { return true; }
+-void msg_stop() { }
++
++// ── App lifecycle callbacks ──
++void msg_start() {
++  msgView = MSG_INBOX;
++  // Auto-scroll to newest
++  if (msgCount > MSG_VISIBLE) msgScroll = msgCount - MSG_VISIBLE;
++  else msgScroll = 0;
++  msg_drawInbox();
++}
++
++void msg_tick() {
++  // Redraw compose for blinking cursor
++  if (msgView == MSG_COMPOSE) {
++    static unsigned long lastBlink = 0;
++    if (millis() - lastBlink >= 500) {
++      lastBlink = millis();
++      msg_drawCompose();
++    }
++  }
++}
++
++void msg_button(uint8_t id) {
++  if (msgView == MSG_INBOX) {
++    switch (id) {
++      case BTN_UP:
++        if (msgScroll > 0) { msgScroll--; msg_drawInbox(); }
++        break;
++      case BTN_DOWN:
++        if (msgScroll + MSG_VISIBLE < msgCount) { msgScroll++; msg_drawInbox(); }
++        break;
++      case BTN_ENTER:
++        // Switch to compose
++        msgView = MSG_COMPOSE;
++        memset(msgComposeBuf, 0, sizeof(msgComposeBuf));
++        msgComposeCursor = 0;
++        t9_lastKey = -1;
++        t9_tapCount = 0;
++        msg_drawCompose();
++        break;
++    }
++  } else if (msgView == MSG_COMPOSE) {
++    // T9 input
++    int key = t9_keyFromButton(id);
++    if (key >= 0) {
++      unsigned long now = millis();
++      if (key == t9_lastKey && (now - t9_lastTapTime < T9_TIMEOUT)) {
++        t9_tapCount++;
++        if (msgComposeCursor > 0) {
++          int len = strlen(t9_chars[key]);
++          msgComposeBuf[msgComposeCursor - 1] = t9_chars[key][t9_tapCount % len];
++        }
++      } else {
++        t9_tapCount = 0;
++        if (msgComposeCursor < MSG_TEXT_LEN - 1) {
++          msgComposeBuf[msgComposeCursor] = t9_chars[key][0];
++          msgComposeCursor++;
++          msgComposeBuf[msgComposeCursor] = '\0';
++        }
++      }
++      t9_lastKey = key;
++      t9_lastTapTime = millis();
++      msg_drawCompose();
++      return;
++    }
++
++    // ENTER = send
++    if (id == BTN_ENTER && msgComposeCursor > 0) {
++      if (loraSend(msgComposeBuf)) {
++        // Store in our inbox as outgoing
++        msgPush(userName, msgComposeBuf, true);
++        // Brief confirmation buzz
++        ledcWriteTone(0, 1200);
++        delay(80);
++        ledcWriteTone(0, 0);
++      } else {
++        // Error buzz
++        ledcWriteTone(0, 200);
++        delay(200);
++        ledcWriteTone(0, 0);
++      }
++      // Return to inbox
++      msgView = MSG_INBOX;
++      if (msgCount > MSG_VISIBLE) msgScroll = msgCount - MSG_VISIBLE;
++      else msgScroll = 0;
++      msg_drawInbox();
++      return;
++    }
++
++    // HASH (#) = cancel compose, return to inbox
++    if (id == BTN_HASH) {
++      msgView = MSG_INBOX;
++      msg_drawInbox();
++      return;
++    }
++  }
++}
++
++bool msg_back() {
++  if (msgView == MSG_COMPOSE) {
++    // Backspace
++    if (msgComposeCursor > 0) {
++      msgComposeCursor--;
++      msgComposeBuf[msgComposeCursor] = '\0';
++      t9_lastKey = -1;
++      t9_tapCount = 0;
++      msg_drawCompose();
++      return false;  // don't exit app
++    }
++    // Empty compose → return to inbox
++    msgView = MSG_INBOX;
++    msg_drawInbox();
++    return false;  // don't exit app
++  }
++  // In inbox → exit app
++  return true;
++}
++
++void msg_stop() {
++  msgView = MSG_INBOX;
++}
+ 
+ // ═══════════════════════════════════════════════════════════
+ //  APP: Settings (live device info)
+@@ -1796,6 +2186,7 @@ void setup() {
+ 
+   Chatter.begin();
+   buzzerInit();
++  loraInit();
+ 
+   display = Chatter.getDisplay();
+   canvas  = display->getBaseSprite();
+@@ -1897,6 +2288,26 @@ void loop() {
+   if (osState == STATE_APP && activeApp)
+     activeApp->onTick();
+ 
++  // ── Background LoRa receive (runs in ALL states) ──
++  if (loraReceive()) {
++    // New message arrived — notification beep (two short chirps)
++    ledcWriteTone(0, 1500);
++    delay(60);
++    ledcWriteTone(0, 0);
++    delay(40);
++    ledcWriteTone(0, 1500);
++    delay(60);
++    ledcWriteTone(0, 0);
++
++    // If we're currently viewing the inbox, refresh it
++    if (osState == STATE_APP && activeApp &&
++        activeApp->onStart == msg_start && msgView == MSG_INBOX) {
++      if (msgCount > MSG_VISIBLE) msgScroll = msgCount - MSG_VISIBLE;
++      msg_drawInbox();
++    }
++    Serial.printf("[LoRa] Inbox: %d messages\n", msgCount);
++  }
++
+   if (needsRedraw) {
+     display->commit();
+     needsRedraw = false;
