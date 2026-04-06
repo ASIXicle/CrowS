@@ -1,0 +1,364 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index d8c6555..2e6ffc5 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -194,13 +194,18 @@ bool loraSend(const char* text) {
+ }
+ 
+ // ── Process received packet (called from loop) ──
+-// Returns true if a valid CrowS message was received
++// Forward declaration — Shine Finder proximity tracking
++void shineUpdate(const char* name, float rssi, float snr);
++
++// Returns true if a valid CrowS CHAT message was received
+ bool loraReceive() {
+   if (!loraReady || !loraRxFlag) return false;
+   loraRxFlag = false;
+ 
+   String raw;
+   int16_t state = radio->readData(raw);
++  float rxRSSI = radio->getRSSI();
++  float rxSNR  = radio->getSNR();
+   radio->startReceive();  // always restart
+ 
+   if (state != RADIOLIB_ERR_NONE) {
+@@ -209,12 +214,21 @@ bool loraReceive() {
+   }
+ 
+   Serial.printf("[LoRa] RX: %s (RSSI %.1f, SNR %.1f)\n",
+-                raw.c_str(), radio->getRSSI(), radio->getSNR());
++                raw.c_str(), rxRSSI, rxSNR);
++
++  // ── SHINE beacon: "SHINE:username" ──
++  if (raw.startsWith("SHINE:")) {
++    String who = raw.substring(6);
++    if (who.length() > 0 && strcmp(who.c_str(), userName) != 0) {
++      shineUpdate(who.c_str(), rxRSSI, rxSNR);
++    }
++    return false;  // not a chat message
++  }
+ 
+-  // Parse: CROWS:sender:text
++  // ── Chat message: "CROWS:sender:text" ──
+   if (!raw.startsWith(MSG_PROTO ":")) return false;
+ 
+-  int nameStart = strlen(MSG_PROTO) + 1;  // skip "CROWS:"
++  int nameStart = strlen(MSG_PROTO) + 1;
+   int nameEnd = raw.indexOf(':', nameStart);
+   if (nameEnd < 0 || nameEnd == nameStart) return false;
+ 
+@@ -222,13 +236,113 @@ bool loraReceive() {
+   String text   = raw.substring(nameEnd + 1);
+   if (text.length() == 0) return false;
+ 
+-  // Don't store our own messages (if we hear our own TX echo)
+   if (strcmp(sender.c_str(), userName) == 0) return false;
+ 
+   msgPush(sender.c_str(), text.c_str(), false);
+   return true;
+ }
+ 
++// ═══════════════════════════════════════════════════════════
++//  SHINE FINDER — LoRa proximity detection
++// ═══════════════════════════════════════════════════════════
++/*
++ * Broadcasts "SHINE:username" beacons every 2s while the app is open.
++ * Listens for other devices' beacons, displays them sorted by RSSI.
++ * Closer devices = stronger signal = higher-pitched proximity tone.
++ */
++
++#define SHINE_MAX        8
++#define SHINE_TIMEOUT    10000  // ms — device removed if not heard
++#define SHINE_BEACON_MS  2000   // ms between beacon broadcasts
++
++struct ShineDevice {
++  char  name[MSG_NAME_LEN];
++  float rssi;
++  float snr;
++  unsigned long lastSeen;  // millis()
++};
++
++ShineDevice shineDevices[SHINE_MAX];
++int  shineCount = 0;
++bool shineActive = false;     // true while Shine Finder app is running
++unsigned long shineLastTx = 0;
++
++// Add or update a device in the detected list
++void shineUpdate(const char* name, float rssi, float snr) {
++  unsigned long now = millis();
++
++  // Update existing?
++  for (int i = 0; i < shineCount; i++) {
++    if (strcmp(shineDevices[i].name, name) == 0) {
++      shineDevices[i].rssi = rssi;
++      shineDevices[i].snr  = snr;
++      shineDevices[i].lastSeen = now;
++      return;
++    }
++  }
++
++  // Add new (drop oldest if full)
++  if (shineCount >= SHINE_MAX) {
++    // Overwrite the one with oldest lastSeen
++    int oldest = 0;
++    for (int i = 1; i < SHINE_MAX; i++) {
++      if (shineDevices[i].lastSeen < shineDevices[oldest].lastSeen)
++        oldest = i;
++    }
++    ShineDevice* d = &shineDevices[oldest];
++    strncpy(d->name, name, MSG_NAME_LEN - 1);
++    d->name[MSG_NAME_LEN - 1] = '\0';
++    d->rssi = rssi;
++    d->snr  = snr;
++    d->lastSeen = now;
++    return;
++  }
++
++  ShineDevice* d = &shineDevices[shineCount];
++  strncpy(d->name, name, MSG_NAME_LEN - 1);
++  d->name[MSG_NAME_LEN - 1] = '\0';
++  d->rssi = rssi;
++  d->snr  = snr;
++  d->lastSeen = now;
++  shineCount++;
++}
++
++// Remove devices not heard from recently
++void shinePurge() {
++  unsigned long now = millis();
++  for (int i = shineCount - 1; i >= 0; i--) {
++    if (now - shineDevices[i].lastSeen > SHINE_TIMEOUT) {
++      // Shift remaining down
++      for (int j = i; j < shineCount - 1; j++)
++        shineDevices[j] = shineDevices[j + 1];
++      shineCount--;
++    }
++  }
++}
++
++// Sort by RSSI descending (strongest first)
++void shineSort() {
++  for (int i = 0; i < shineCount - 1; i++) {
++    for (int j = i + 1; j < shineCount; j++) {
++      if (shineDevices[j].rssi > shineDevices[i].rssi) {
++        ShineDevice tmp = shineDevices[i];
++        shineDevices[i] = shineDevices[j];
++        shineDevices[j] = tmp;
++      }
++    }
++  }
++}
++
++// Broadcast a beacon
++void shineSendBeacon() {
++  if (!loraReady) return;
++  char pkt[32];
++  snprintf(pkt, sizeof(pkt), "SHINE:%s", userName);
++  radio->standby();
++  radio->transmit((uint8_t*)pkt, strlen(pkt));
++  radio->startReceive();
++}
++
+ // ═══════════════════════════════════════════════════════════
+ //  INPUT
+ // ═══════════════════════════════════════════════════════════
+@@ -1842,6 +1956,182 @@ void msg_stop() {
+   msgView = MSG_INBOX;
+ }
+ 
++// ═══════════════════════════════════════════════════════════
++//  APP: Shine Finder — LoRa proximity detector
++// ═══════════════════════════════════════════════════════════
++/*
++ * Broadcasts beacons, listens for others, shows detected devices
++ * sorted by signal strength. Closer = stronger bar + higher tone.
++ *
++ * RSSI guide:  > -50 dBm = very close (green)
++ *             -50 to -75  = nearby     (green)
++ *             -75 to -95  = in range   (yellow)
++ *              < -95 dBm  = distant    (red)
++ */
++
++#define SHINE_VISIBLE 4  // max devices shown on screen
++
++// Map RSSI to a bar width (0-80 pixels)
++int shineBarWidth(float rssi) {
++  // Clamp to -120..-20 range, map to 0..80
++  float clamped = rssi;
++  if (clamped < -120.0f) clamped = -120.0f;
++  if (clamped > -20.0f)  clamped = -20.0f;
++  return (int)((clamped + 120.0f) * 0.8f);  // 100 dBm range → 80px
++}
++
++// Map RSSI to bar color
++uint16_t shineBarColor(float rssi) {
++  if (rssi > -60.0f)  return TFT_GREEN;
++  if (rssi > -80.0f)  return TFT_YELLOW;
++  return TFT_RED;
++}
++
++// Map RSSI to proximity buzzer pitch (0 = silent)
++int shineTonePitch(float rssi) {
++  if (rssi > -50.0f)  return 2400;
++  if (rssi > -65.0f)  return 1800;
++  if (rssi > -80.0f)  return 1200;
++  if (rssi > -95.0f)  return 600;
++  return 0;
++}
++
++void shine_draw() {
++  canvas->clear(COL_BG);
++
++  // Header
++  canvas->fillRect(0, 0, SCREEN_W, 14, COL_PURPLE);
++  canvas->setTextSize(1);
++  canvas->setTextColor(TFT_WHITE);
++  canvas->setCursor(5, 3);
++  canvas->print("SHINE FINDER");
++
++  // Device count
++  char countBuf[8];
++  snprintf(countBuf, sizeof(countBuf), "%d", shineCount);
++  canvas->setTextColor(shineCount > 0 ? TFT_GREEN : COL_HINT);
++  canvas->setCursor(SCREEN_W - strlen(countBuf) * 6 - 4, 3);
++  canvas->print(countBuf);
++
++  if (shineCount == 0) {
++    // Searching animation (rotating dots)
++    canvas->setTextColor(COL_HINT);
++    canvas->setCursor(28, 50);
++    canvas->print("Searching");
++    int dots = (millis() / 500) % 4;
++    for (int d = 0; d < dots; d++) canvas->print(".");
++
++    canvas->setCursor(16, 70);
++    canvas->print("Waiting for beacons");
++  } else {
++    shinePurge();
++    shineSort();
++
++    int y = 18;
++    int shown = (shineCount < SHINE_VISIBLE) ? shineCount : SHINE_VISIBLE;
++    int slotH = 108 / shown;  // distribute available height evenly
++    if (slotH > 28) slotH = 28;
++
++    for (int i = 0; i < shown; i++) {
++      ShineDevice* d = &shineDevices[i];
++      int row_y = y + i * slotH;
++
++      // Device name
++      canvas->setTextColor(TFT_GREEN);
++      canvas->setCursor(4, row_y);
++      char nameBuf[11];
++      strncpy(nameBuf, d->name, 10);
++      nameBuf[10] = '\0';
++      canvas->print(nameBuf);
++
++      // RSSI + SNR text (right-aligned on name row)
++      char statBuf[16];
++      snprintf(statBuf, sizeof(statBuf), "%.0f dBm", d->rssi);
++      int statW = strlen(statBuf) * 6;
++      canvas->setTextColor(shineBarColor(d->rssi));
++      canvas->setCursor(SCREEN_W - statW - 4, row_y);
++      canvas->print(statBuf);
++
++      // Signal strength bar
++      int barY = row_y + 12;
++      int barW = shineBarWidth(d->rssi);
++      uint16_t barCol = shineBarColor(d->rssi);
++
++      // Bar background (dark outline)
++      canvas->fillRect(4, barY, 80, 6, COL_DIVIDER);
++      // Filled portion
++      if (barW > 0) {
++        canvas->fillRect(4, barY, barW, 6, barCol);
++      }
++
++      // Age indicator (seconds since last heard)
++      unsigned long age = (millis() - d->lastSeen) / 1000;
++      if (age > 0) {
++        char ageBuf[8];
++        snprintf(ageBuf, sizeof(ageBuf), "%lus", age);
++        canvas->setTextColor(COL_HINT);
++        canvas->setCursor(90, barY - 1);
++        canvas->print(ageBuf);
++      }
++    }
++  }
++
++  // Bottom hint
++  canvas->setTextColor(COL_HINT);
++  canvas->setCursor(30, 120);
++  canvas->print("BACK to exit");
++
++  needsRedraw = true;
++}
++
++void shine_start() {
++  shineActive = true;
++  shineLastTx = 0;  // send beacon immediately
++  shine_draw();
++}
++
++void shine_tick() {
++  unsigned long now = millis();
++
++  // Broadcast beacon periodically
++  if (now - shineLastTx >= SHINE_BEACON_MS) {
++    shineLastTx = now;
++    shineSendBeacon();
++  }
++
++  // Redraw every ~1s for responsive display
++  static unsigned long lastDraw = 0;
++  if (now - lastDraw >= 1000) {
++    lastDraw = now;
++
++    // Proximity tone for closest device
++    if (shineCount > 0) {
++      shineSort();
++      int pitch = shineTonePitch(shineDevices[0].rssi);
++      if (pitch > 0) {
++        ledcWriteTone(0, pitch);
++        delay(30);
++        ledcWriteTone(0, 0);
++      }
++    }
++
++    shine_draw();
++  }
++}
++
++void shine_button(uint8_t id) {
++  // No button actions needed — display is automatic
++}
++
++bool shine_back() {
++  return true;  // exit to menu
++}
++
++void shine_stop() {
++  shineActive = false;
++  ledcWriteTone(0, 0);  // silence buzzer
++}
++
+ // ═══════════════════════════════════════════════════════════
+ //  APP: Settings (live device info)
+ // ═══════════════════════════════════════════════════════════
+@@ -1977,6 +2267,7 @@ CrowSApp gamesApps[] = {
+ 
+ CrowSApp appsApps[] = {
+   { "Ghost Detector", TFT_GREEN,  magOnStart,     magOnTick,     magOnButton,     magOnBack,     magOnStop     },
++  { "Shine Finder",   TFT_YELLOW, shine_start,    shine_tick,    shine_button,    shine_back,    shine_stop    },
+   { "Music",          TFT_CYAN,   musicOnStart,   musicOnTick,   musicOnButton,   musicOnBack,   musicOnStop   },
+ };
+ 
+@@ -1991,7 +2282,7 @@ CrowSApp systemApps[] = {
+ #define CAT_COUNT 4
+ CrowSCategory categories[CAT_COUNT] = {
+   { "Games",     TFT_CYAN,    gamesApps,     1 },
+-  { "Apps",      TFT_GREEN,   appsApps,      2 },
++  { "Apps",      TFT_GREEN,   appsApps,      3 },
+   { "Messaging", TFT_MAGENTA, messagingApps, 1 },
+   { "System",    TFT_YELLOW,  systemApps,    1 },
+ };
