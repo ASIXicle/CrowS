@@ -4,7 +4,7 @@
  *
  * Target:  CircuitMess Chatter 2.0
  *          ESP32-D0WD, ST7735S 160x128 TFT, 74HC165 shift register input
- * Build:   Arduino IDE 2.3.8, CircuitMess ESP32 Boards v1.8.3, "No OTA"
+ * Build:   PlatformIO / VSCodium, CircuitMess ESP32 Boards v1.8.3, "No OTA"
  *
  * Architecture
  * ────────────
@@ -22,7 +22,7 @@
 #include <Chatter.h>
 #include <Loop/LoopManager.h>
 
-#define CROWS_VERSION "0.2.0"
+#define CROWS_VERSION "0.3.0"
 
 // ═══════════════════════════════════════════════════════════
 //  DISPLAY
@@ -261,7 +261,6 @@ void matrixSplash() {
         canvas->setTextSize(1);
         canvas->setTextColor(fadeFrame > 20 ? COL_HINT : MATRIX_G4);
         canvas->setCursor(17, 70);
-        canvas->print("ChatterOS with Substance");
       }
     }
 
@@ -1084,7 +1083,7 @@ void musicOnStop() {
 }
 
 // =====================================================================
-// CrowS Magnet Detector App — Hall Effect Sensor
+// CrowS Ghost Detector App — Hall Effect Sensor
 // =====================================================================
 
 // ----- STATE -----
@@ -1119,7 +1118,7 @@ void magDrawScreen(int strength) {
   canvas->setTextSize(1);
   canvas->setTextColor(TFT_CYAN);
   canvas->setCursor(4, 3);
-  canvas->print("Magnet Detector");
+  canvas->print("GhostDetector");
 
   // Strength number
   canvas->setTextSize(2);
@@ -1181,7 +1180,7 @@ void magDrawScreen(int strength) {
   canvas->setCursor(4, 105);
   canvas->print("ENTER recalibrate");
   canvas->setCursor(4, 118);
-  canvas->print("Move magnet near ESP32");
+  canvas->print("Scanning for entities...");
 
   needsRedraw = true;
 }
@@ -1406,7 +1405,7 @@ void settings_stop() { }
 CrowSApp apps[APP_COUNT] = {
   { "ChatterTris",  TFT_CYAN,   tris_start,     tris_tick,     tris_button,     tris_back,     tris_stop     },
   { "Music", TFT_CYAN, musicOnStart, musicOnTick, musicOnButton, musicOnBack, musicOnStop },
-  { "Detector", TFT_GREEN, magOnStart, magOnTick, magOnButton, magOnBack, magOnStop },
+  { " GhostDetector", TFT_GREEN, magOnStart, magOnTick, magOnButton, magOnBack, magOnStop },
   { "Messages",     TFT_GREEN,  msg_start,      msg_tick,      msg_button,      msg_back,      msg_stop      },
   { "Settings",     TFT_YELLOW, settings_start, settings_tick, settings_button, settings_back, settings_stop },
 };
@@ -1452,7 +1451,6 @@ void drawMenu() {
   canvas->setTextSize(1);
   canvas->setTextColor(COL_HINT);
   canvas->setCursor(17, TITLE_Y + 16);
-  canvas->print("ChatterOS with Substance");
 
   // Keep selection in visible window
   if (menuSel < menuScroll) menuScroll = menuSel;
