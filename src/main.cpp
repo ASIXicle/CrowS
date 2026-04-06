@@ -130,6 +130,13 @@ typedef struct {
   void (*onStop)();
 } CrowSApp;
 
+typedef struct {
+  const char* name;
+  uint16_t    color;
+  CrowSApp*   apps;
+  int         appCount;
+} CrowSCategory;
+
 // Forward declarations
 void drawMenu();
 void drawStatusBar();
@@ -142,7 +149,11 @@ enum OSState { STATE_MENU, STATE_APP };
 OSState osState = STATE_MENU;
 
 int  menuSel = 0;
-int  menuScroll = 0;   // <-- add this line
+int  menuScroll = 0;
+int  menuLevel = 0;      // 0 = categories, 1 = apps
+int  catSel = 0;
+int  catScroll = 0;
+int  currentCat = 0;
 CrowSApp* activeApp = NULL;
 
 // ═══════════════════════════════════════════════════════════
@@ -1400,14 +1411,29 @@ void settings_stop() { }
 //  APP REGISTRY
 // ═══════════════════════════════════════════════════════════
 
-#define APP_COUNT 5
+CrowSApp gamesApps[] = {
+  { "ChatterTris",    TFT_CYAN,   tris_start,     tris_tick,     tris_button,     tris_back,     tris_stop     },
+};
 
-CrowSApp apps[APP_COUNT] = {
-  { "ChatterTris",  TFT_CYAN,   tris_start,     tris_tick,     tris_button,     tris_back,     tris_stop     },
-  { "Music", TFT_CYAN, musicOnStart, musicOnTick, musicOnButton, musicOnBack, musicOnStop },
-  { " GhostDetector", TFT_GREEN, magOnStart, magOnTick, magOnButton, magOnBack, magOnStop },
-  { "Messages",     TFT_GREEN,  msg_start,      msg_tick,      msg_button,      msg_back,      msg_stop      },
-  { "Settings",     TFT_YELLOW, settings_start, settings_tick, settings_button, settings_back, settings_stop },
+CrowSApp appsApps[] = {
+  { "Ghost Detector", TFT_GREEN,  magOnStart,     magOnTick,     magOnButton,     magOnBack,     magOnStop     },
+  { "Music",          TFT_CYAN,   musicOnStart,   musicOnTick,   musicOnButton,   musicOnBack,   musicOnStop   },
+};
+
+CrowSApp messagingApps[] = {
+  { "Messages",       TFT_GREEN,  msg_start,      msg_tick,      msg_button,      msg_back,      msg_stop      },
+};
+
+CrowSApp systemApps[] = {
+  { "Settings",       TFT_YELLOW, settings_start, settings_tick, settings_button, settings_back, settings_stop },
+};
+
+#define CAT_COUNT 4
+CrowSCategory categories[CAT_COUNT] = {
+  { "Games",     TFT_CYAN,    gamesApps,     1 },
+  { "Apps",      TFT_GREEN,   appsApps,      2 },
+  { "Messaging", TFT_MAGENTA, messagingApps, 1 },
+  { "System",    TFT_YELLOW,  systemApps,    1 },
 };
 
 // ═══════════════════════════════════════════════════════════
@@ -1448,44 +1474,81 @@ void drawMenu() {
   canvas->setCursor(50, TITLE_Y);
   canvas->print("CrowS");
 
-  canvas->setTextSize(1);
-  canvas->setTextColor(COL_HINT);
-  canvas->setCursor(17, TITLE_Y + 16);
+  if (menuLevel == 0) {
+    // ── CATEGORY VIEW ──
+    if (catSel < catScroll) catScroll = catSel;
+    if (catSel >= catScroll + MENU_VISIBLE) catScroll = catSel - MENU_VISIBLE + 1;
 
-  // Keep selection in visible window
-  if (menuSel < menuScroll) menuScroll = menuSel;
-  if (menuSel >= menuScroll + MENU_VISIBLE) menuScroll = menuSel - MENU_VISIBLE + 1;
-
-  // Draw visible items
-  for (int i = 0; i < MENU_VISIBLE && (menuScroll + i) < APP_COUNT; i++) {
-    int idx = menuScroll + i;
-    int y = MENU_TOP + i * MENU_ITEM_H;
-    if (idx == menuSel) {
-      canvas->fillRect(MENU_PAD_X, y, SCREEN_W - MENU_PAD_X * 2, MENU_ITEM_H - 2, apps[idx].color);
-      canvas->setTextColor(COL_SEL_TEXT);
-    } else {
-      canvas->setTextColor(COL_UNSEL);
+    for (int i = 0; i < MENU_VISIBLE && (catScroll + i) < CAT_COUNT; i++) {
+      int idx = catScroll + i;
+      int y = MENU_TOP + i * MENU_ITEM_H;
+      if (idx == catSel) {
+        canvas->fillRect(MENU_PAD_X, y, SCREEN_W - MENU_PAD_X * 2, MENU_ITEM_H - 2, categories[idx].color);
+        canvas->setTextColor(COL_SEL_TEXT);
+      } else {
+        canvas->setTextColor(COL_UNSEL);
+      }
+      canvas->setTextSize(1);
+      canvas->setCursor(MENU_PAD_X + 8, y + (MENU_ITEM_H - 2 - 8) / 2);
+      canvas->print(categories[idx].name);
     }
+
+    canvas->setTextColor(COL_HINT);
+    if (catScroll > 0) {
+      canvas->setCursor(150, MENU_TOP);
+      canvas->print("^");
+    }
+    if (catScroll + MENU_VISIBLE < CAT_COUNT) {
+      canvas->setCursor(150, MENU_TOP + (MENU_VISIBLE - 1) * MENU_ITEM_H + 4);
+      canvas->print("v");
+    }
+
+    canvas->setTextColor(COL_HINT);
     canvas->setTextSize(1);
-    canvas->setCursor(MENU_PAD_X + 8, y + (MENU_ITEM_H - 2 - 8) / 2);
-    canvas->print(apps[idx].name);
-  }
+    canvas->setCursor(23, HINT_Y);
+    canvas->print("UP/DN  ENTER select");
 
-  // Scroll indicators
-  canvas->setTextColor(COL_HINT);
-  if (menuScroll > 0) {
-    canvas->setCursor(150, MENU_TOP);
-    canvas->print("^");
-  }
-  if (menuScroll + MENU_VISIBLE < APP_COUNT) {
-    canvas->setCursor(150, MENU_TOP + (MENU_VISIBLE - 1) * MENU_ITEM_H + 4);
-    canvas->print("v");
-  }
+  } else {
+    // ── APP VIEW (inside a category) ──
+    CrowSCategory* cat = &categories[currentCat];
 
-  canvas->setTextColor(COL_HINT);
-  canvas->setTextSize(1);
-  canvas->setCursor(23, HINT_Y);
-  canvas->print("UP/DN  ENTER select");
+    canvas->setTextSize(1);
+    canvas->setTextColor(COL_HINT);
+    canvas->setCursor(17, TITLE_Y + 16);
+    canvas->print(cat->name);
+
+    if (menuSel < menuScroll) menuScroll = menuSel;
+    if (menuSel >= menuScroll + MENU_VISIBLE) menuScroll = menuSel - MENU_VISIBLE + 1;
+
+    for (int i = 0; i < MENU_VISIBLE && (menuScroll + i) < cat->appCount; i++) {
+      int idx = menuScroll + i;
+      int y = MENU_TOP + i * MENU_ITEM_H;
+      if (idx == menuSel) {
+        canvas->fillRect(MENU_PAD_X, y, SCREEN_W - MENU_PAD_X * 2, MENU_ITEM_H - 2, cat->apps[idx].color);
+        canvas->setTextColor(COL_SEL_TEXT);
+      } else {
+        canvas->setTextColor(COL_UNSEL);
+      }
+      canvas->setTextSize(1);
+      canvas->setCursor(MENU_PAD_X + 8, y + (MENU_ITEM_H - 2 - 8) / 2);
+      canvas->print(cat->apps[idx].name);
+    }
+
+    canvas->setTextColor(COL_HINT);
+    if (menuScroll > 0) {
+      canvas->setCursor(150, MENU_TOP);
+      canvas->print("^");
+    }
+    if (menuScroll + MENU_VISIBLE < cat->appCount) {
+      canvas->setCursor(150, MENU_TOP + (MENU_VISIBLE - 1) * MENU_ITEM_H + 4);
+      canvas->print("v");
+    }
+
+    canvas->setTextColor(COL_HINT);
+    canvas->setTextSize(1);
+    canvas->setCursor(10, HINT_Y);
+    canvas->print("UP/DN  ENTER  BACK");
+  }
 
   needsRedraw = true;
 }
@@ -1494,7 +1557,8 @@ void drawMenu() {
 //  APP LAUNCH / EXIT
 // ═══════════════════════════════════════════════════════════
 void launchApp(int index) {
-  activeApp = &apps[index];
+  CrowSCategory* cat = &categories[currentCat];
+  activeApp = &cat->apps[index];
   osState = STATE_APP;
   activeApp->onStart();
 }
@@ -1503,6 +1567,7 @@ void exitApp() {
   if (activeApp) activeApp->onStop();
   activeApp = NULL;
   osState = STATE_MENU;
+  menuLevel = 1;  // return to app list, not categories
   drawMenu();
 }
 
@@ -1547,20 +1612,49 @@ void loop() {
       if (!(pressed & (1 << i))) continue;
 
       if (osState == STATE_MENU) {
-        switch (i) {
-          case BTN_UP:
-            menuSel--;
-            if (menuSel < 0) menuSel = APP_COUNT - 1;
-            drawMenu();
-            break;
-          case BTN_DOWN:
-            menuSel++;
-            if (menuSel >= APP_COUNT) menuSel = 0;
-            drawMenu();
-            break;
-          case BTN_ENTER:
-            launchApp(menuSel);
-            break;
+        if (menuLevel == 0) {
+          // Category navigation
+          switch (i) {
+            case BTN_UP:
+              catSel--;
+              if (catSel < 0) catSel = CAT_COUNT - 1;
+              drawMenu();
+              break;
+            case BTN_DOWN:
+              catSel++;
+              if (catSel >= CAT_COUNT) catSel = 0;
+              drawMenu();
+              break;
+            case BTN_ENTER:
+              currentCat = catSel;
+              menuLevel = 1;
+              menuSel = 0;
+              menuScroll = 0;
+              drawMenu();
+              break;
+          }
+        } else {
+          // App navigation within category
+          CrowSCategory* cat = &categories[currentCat];
+          switch (i) {
+            case BTN_UP:
+              menuSel--;
+              if (menuSel < 0) menuSel = cat->appCount - 1;
+              drawMenu();
+              break;
+            case BTN_DOWN:
+              menuSel++;
+              if (menuSel >= cat->appCount) menuSel = 0;
+              drawMenu();
+              break;
+            case BTN_ENTER:
+              launchApp(menuSel);
+              break;
+            case BTN_BACK:
+              menuLevel = 0;
+              drawMenu();
+              break;
+          }
         }
       } else if (osState == STATE_APP && activeApp) {
         if (i == BTN_BACK) {
