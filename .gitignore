@@ -9,6 +9,7 @@
 *.bin
 *.elf
 *.map
+*.patch
 
 # OS junk
 .DS_Store
