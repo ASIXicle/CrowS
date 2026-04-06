@@ -1540,7 +1540,52 @@ void magOnStop() {
 enum MsgView { MSG_INBOX, MSG_COMPOSE };
 MsgView  msgView = MSG_INBOX;
 int      msgScroll = 0;       // inbox scroll position (index of topmost visible msg)
-#define  MSG_VISIBLE 5        // lines visible in inbox (128 - header) / ~20px
+#define  MSG_VISIBLE 3        // messages visible in inbox (30px each)
+#define  MSG_LINE_W  25       // chars per wrapped line (25×6 = 150px + margins)
+#define  MSG_MAX_LINES 2      // max text lines per message in inbox
+
+// Word-wrap text into lines, breaking at spaces when possible.
+// Returns number of lines used (up to maxLines).
+// Last line gets "..." if text continues beyond capacity.
+int msgWrapText(const char* text, char buf[][MSG_LINE_W + 1], int maxLines) {
+  int len = strlen(text);
+  int pos = 0;
+  int line = 0;
+
+  while (pos < len && line < maxLines) {
+    int remaining = len - pos;
+
+    // Fits on this line?
+    if (remaining <= MSG_LINE_W) {
+      strncpy(buf[line], text + pos, remaining);
+      buf[line][remaining] = '\0';
+      line++;
+      break;
+    }
+
+    // Last available line but more text remains → truncate with "..."
+    if (line == maxLines - 1) {
+      strncpy(buf[line], text + pos, MSG_LINE_W - 3);
+      buf[line][MSG_LINE_W - 3] = '\0';
+      strcat(buf[line], "...");
+      line++;
+      break;
+    }
+
+    // Find a space to break at (search backwards from limit)
+    int brk = MSG_LINE_W;
+    for (int j = MSG_LINE_W; j > MSG_LINE_W / 2; j--) {
+      if (text[pos + j] == ' ') { brk = j; break; }
+    }
+
+    strncpy(buf[line], text + pos, brk);
+    buf[line][brk] = '\0';
+    pos += brk;
+    if (text[pos] == ' ') pos++;  // skip the space at break
+    line++;
+  }
+  return line;
+}
 
 // Compose buffer (separate from wizard)
 char msgComposeBuf[MSG_TEXT_LEN] = {0};
@@ -1580,7 +1625,7 @@ void msg_drawInbox() {
     int y = 18;
     for (int i = 0; i < MSG_VISIBLE && (msgScroll + i) < msgCount; i++) {
       CrowSMsg* m = &msgInbox[msgScroll + i];
-      int row_y = y + i * 20;
+      int row_y = y + i * 30;
 
       // Sender label
       canvas->setTextColor(m->outgoing ? COL_PURPLE : TFT_GREEN);
@@ -1588,21 +1633,20 @@ void msg_drawInbox() {
       if (m->outgoing) {
         canvas->print("You");
       } else {
-        // Truncate sender to 8 chars for display
         char senderBuf[9];
         strncpy(senderBuf, m->sender, 8);
         senderBuf[8] = '\0';
         canvas->print(senderBuf);
       }
 
-      // Message text (truncated to fit)
+      // Wrapped message text (up to 2 lines)
       canvas->setTextColor(TFT_WHITE);
-      canvas->setCursor(4, row_y + 10);
-      // Max ~26 chars at 6px wide = 156px
-      char dispText[27];
-      strncpy(dispText, m->text, 26);
-      dispText[26] = '\0';
-      canvas->print(dispText);
+      char lines[MSG_MAX_LINES][MSG_LINE_W + 1];
+      int nLines = msgWrapText(m->text, lines, MSG_MAX_LINES);
+      for (int ln = 0; ln < nLines; ln++) {
+        canvas->setCursor(4, row_y + 10 + ln * 10);
+        canvas->print(lines[ln]);
+      }
     }
 
     // Scroll indicators
@@ -1612,7 +1656,7 @@ void msg_drawInbox() {
       canvas->print("^");
     }
     if (msgScroll + MSG_VISIBLE < msgCount) {
-      canvas->setCursor(150, 18 + (MSG_VISIBLE - 1) * 20);
+      canvas->setCursor(150, 18 + (MSG_VISIBLE - 1) * 30 + 10);
       canvas->print("v");
     }
   }
