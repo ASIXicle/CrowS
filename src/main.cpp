@@ -21,6 +21,7 @@
 #include <Arduino.h>
 #include <Chatter.h>
 #include <Loop/LoopManager.h>
+#include <Preferences.h>
 
 #define CROWS_VERSION "0.3.0"
 
@@ -74,7 +75,8 @@ bool needsRedraw = true;
 //  COLORS (RGB565)
 // ═══════════════════════════════════════════════════════════
 #define COL_BG         TFT_BLACK
-#define COL_TITLE      TFT_CYAN
+#define COL_PURPLE     0xB81F   // CrowS brand purple
+#define COL_TITLE      COL_PURPLE
 #define COL_SEL_TEXT   TFT_BLACK
 #define COL_UNSEL      0x8410   // medium gray
 #define COL_HINT       0x4208   // dark gray
@@ -83,7 +85,7 @@ bool needsRedraw = true;
 #define COL_BAT_OK     TFT_GREEN
 #define COL_BAT_LOW    TFT_YELLOW
 #define COL_BAT_CRIT   TFT_RED
-#define COL_ACCENT     TFT_CYAN
+#define COL_ACCENT     COL_PURPLE
 
 // ═══════════════════════════════════════════════════════════
 //  INPUT
@@ -140,12 +142,13 @@ typedef struct {
 // Forward declarations
 void drawMenu();
 void drawStatusBar();
+void drawWizard();
 int  getBatteryPercent();
 
 // ═══════════════════════════════════════════════════════════
 //  OS STATE
 // ═══════════════════════════════════════════════════════════
-enum OSState { STATE_MENU, STATE_APP };
+enum OSState { STATE_MENU, STATE_APP, STATE_WIZARD };
 OSState osState = STATE_MENU;
 
 int  menuSel = 0;
@@ -155,6 +158,78 @@ int  catSel = 0;
 int  catScroll = 0;
 int  currentCat = 0;
 CrowSApp* activeApp = NULL;
+
+// ═══════════════════════════════════════════════════════════
+//  IDENTITY — Name stored in NVS (persists across reboots)
+// ═══════════════════════════════════════════════════════════
+Preferences prefs;
+char userName[16] = {0};
+
+bool identityExists() {
+  prefs.begin("crows", true);  // read-only
+  String saved = prefs.getString("userName", "");
+  prefs.end();
+  return saved.length() > 0;
+}
+
+void identityLoad() {
+  prefs.begin("crows", true);
+  String saved = prefs.getString("userName", "");
+  prefs.end();
+  strncpy(userName, saved.c_str(), 15);
+  userName[15] = '\0';
+}
+
+void identitySave(const char* name) {
+  prefs.begin("crows", false);  // read-write
+  prefs.putString("userName", name);
+  prefs.end();
+  strncpy(userName, name, 15);
+  userName[15] = '\0';
+}
+
+// ═══════════════════════════════════════════════════════════
+//  T9 TEXT INPUT
+// ═══════════════════════════════════════════════════════════
+// Maps keypad button IDs to T9 character sets
+// Key 0 = space/0, Key 1 = punctuation/1, Keys 2-9 = letters
+static const char* t9_chars[] = {
+  " 0",       // key 0 (BTN_0)
+  ".,?!1",    // key 1 (BTN_1)
+  "ABC2",     // key 2 (BTN_2)
+  "DEF3",     // key 3 (BTN_3)
+  "GHI4",     // key 4 (BTN_4)
+  "JKL5",     // key 5 (BTN_5)
+  "MNO6",     // key 6 (BTN_6)
+  "PQRS7",    // key 7 (BTN_7)
+  "TUV8",     // key 8 (BTN_8)
+  "WXYZ9",    // key 9 (BTN_9)
+};
+
+// Map button bit IDs to T9 key index (0-9), or -1 if not a digit key
+int t9_keyFromButton(int btnId) {
+  switch (btnId) {
+    case BTN_0: return 0;
+    case BTN_1: return 1;
+    case BTN_2: return 2;
+    case BTN_3: return 3;
+    case BTN_4: return 4;
+    case BTN_5: return 5;
+    case BTN_6: return 6;
+    case BTN_7: return 7;
+    case BTN_8: return 8;
+    case BTN_9: return 9;
+    default:    return -1;
+  }
+}
+
+// T9 state
+char wizardBuf[16] = {0};
+int  wizardCursor = 0;
+int  t9_lastKey = -1;
+int  t9_tapCount = 0;
+unsigned long t9_lastTapTime = 0;
+#define T9_TIMEOUT 800  // ms before multi-tap commits
 
 // ═══════════════════════════════════════════════════════════
 //  BATTERY — uses Chatter library's Battery class
@@ -1325,6 +1400,7 @@ void msg_stop() { }
 // ═══════════════════════════════════════════════════════════
 unsigned long settingsLastRefresh = 0;
 #define SETTINGS_REFRESH_MS 1000
+int settingsSel = 0;  // 0 = info view, 1 = Reset Name highlighted
 
 void settings_draw() {
   canvas->clear(COL_BG);
@@ -1346,6 +1422,14 @@ void settings_draw() {
   canvas->setTextColor(TFT_WHITE);
   canvas->setCursor(valX, y);
   canvas->print("CrowS v" CROWS_VERSION);
+
+  y += 14;
+  canvas->setTextColor(COL_UNSEL);
+  canvas->setCursor(labelX, y);
+  canvas->print("Name");
+  canvas->setTextColor(COL_PURPLE);
+  canvas->setCursor(valX, y);
+  canvas->print(userName[0] ? userName : "(none)");
 
   y += 14;
   canvas->setTextColor(COL_UNSEL);
@@ -1387,14 +1471,25 @@ void settings_draw() {
   snprintf(buf, sizeof(buf), "%d MHz", ESP.getCpuFreqMHz());
   canvas->print(buf);
 
+  // Reset Name action
+  y += 18;
+  if (settingsSel == 1) {
+    canvas->fillRect(labelX, y - 2, SCREEN_W - labelX * 2, 14, TFT_RED);
+    canvas->setTextColor(TFT_WHITE);
+  } else {
+    canvas->setTextColor(COL_HINT);
+  }
+  canvas->setCursor(labelX + 4, y);
+  canvas->print("Reset Name");
+
   canvas->setTextColor(COL_HINT);
-  canvas->setCursor(40, 116);
-  canvas->print("X to return");
+  canvas->setCursor(20, 116);
+  canvas->print("UP/DN  ENTER  BACK");
 
   needsRedraw = true;
 }
 
-void settings_start() { settingsLastRefresh = 0; }
+void settings_start() { settingsLastRefresh = 0; settingsSel = 0; }
 
 void settings_tick() {
   if (millis() - settingsLastRefresh >= SETTINGS_REFRESH_MS) {
@@ -1403,7 +1498,25 @@ void settings_tick() {
   }
 }
 
-void settings_button(uint8_t id) { }
+void settings_button(uint8_t id) {
+  if (id == BTN_UP || id == BTN_DOWN) {
+    settingsSel = settingsSel ? 0 : 1;
+    settings_draw();
+  }
+  if (id == BTN_ENTER && settingsSel == 1) {
+    // Clear name and go to wizard
+    identitySave("");
+    userName[0] = '\0';
+    if (activeApp) activeApp->onStop();
+    activeApp = NULL;
+    osState = STATE_WIZARD;
+    memset(wizardBuf, 0, sizeof(wizardBuf));
+    wizardCursor = 0;
+    t9_lastKey = -1;
+    t9_tapCount = 0;
+    drawWizard();
+  }
+}
 bool settings_back() { return true; }
 void settings_stop() { }
 
@@ -1437,6 +1550,92 @@ CrowSCategory categories[CAT_COUNT] = {
 };
 
 // ═══════════════════════════════════════════════════════════
+//  SETUP WIZARD — First-run userName entry via T9 input
+// ═══════════════════════════════════════════════════════════
+void drawWizard() {
+  canvas->clear(COL_BG);
+
+  // Header bar
+  canvas->fillRect(0, 0, SCREEN_W, 14, COL_PURPLE);
+  canvas->setTextSize(1);
+  canvas->setTextColor(TFT_WHITE);
+  canvas->setCursor(5, 3);
+  canvas->print("SETUP // NAME");
+
+  // Prompt
+  canvas->setTextColor(COL_PURPLE);
+  canvas->setCursor(10, 24);
+  canvas->print("Enter your name:");
+
+  // Input box
+  canvas->drawRect(10, 40, 140, 22, COL_HINT);
+  canvas->setTextColor(TFT_WHITE);
+  canvas->setTextSize(2);
+  canvas->setCursor(16, 44);
+  canvas->print(wizardBuf);
+  // Blinking cursor
+  if ((millis() / 500) % 2) canvas->print("_");
+
+  // Help text
+  canvas->setTextSize(1);
+  canvas->setTextColor(COL_HINT);
+  canvas->setCursor(10, 72);
+  canvas->print("Keys 0-9: T9 input");
+  canvas->setCursor(10, 84);
+  canvas->print("BACK: delete");
+  canvas->setCursor(10, 96);
+  canvas->print("ENTER: confirm (2+ chars)");
+
+  needsRedraw = true;
+}
+
+void wizardHandleButton(uint8_t btnId) {
+  // T9 digit key?
+  int key = t9_keyFromButton(btnId);
+  if (key >= 0) {
+    unsigned long now = millis();
+    if (key == t9_lastKey && (now - t9_lastTapTime < T9_TIMEOUT)) {
+      // Multi-tap: cycle character at current position
+      t9_tapCount++;
+      if (wizardCursor > 0) {
+        int len = strlen(t9_chars[key]);
+        wizardBuf[wizardCursor - 1] = t9_chars[key][t9_tapCount % len];
+      }
+    } else {
+      // New key: append character
+      t9_tapCount = 0;
+      if (wizardCursor < 15) {
+        wizardBuf[wizardCursor] = t9_chars[key][0];
+        wizardCursor++;
+        wizardBuf[wizardCursor] = '\0';
+      }
+    }
+    t9_lastKey = key;
+    t9_lastTapTime = now;
+    drawWizard();
+    return;
+  }
+
+  // Backspace
+  if (btnId == BTN_BACK && wizardCursor > 0) {
+    wizardCursor--;
+    wizardBuf[wizardCursor] = '\0';
+    t9_lastKey = -1;
+    t9_tapCount = 0;
+    drawWizard();
+    return;
+  }
+
+  // Confirm (need at least 2 chars)
+  if (btnId == BTN_ENTER && wizardCursor >= 2) {
+    identitySave(wizardBuf);
+    osState = STATE_MENU;
+    drawMenu();
+    return;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
 //  MENU DRAWING
 // ═══════════════════════════════════════════════════════════
 #define STATUS_H    12
@@ -1460,6 +1659,14 @@ void drawStatusBar() {
   int textW = strlen(buf) * 6;
   canvas->setCursor(SCREEN_W - textW - 2, 2);
   canvas->print(buf);
+
+  // Name (centered between version and battery)
+  if (userName[0]) {
+    canvas->setTextColor(COL_PURPLE);
+    int csW = strlen(userName) * 6;
+    canvas->setCursor((SCREEN_W - csW) / 2, 2);
+    canvas->print(userName);
+  }
 
   canvas->fillRect(0, STATUS_H, SCREEN_W, 1, COL_DIVIDER);
 }
@@ -1593,7 +1800,19 @@ void setup() {
   digitalWrite(SR_CLK, LOW);
 
   matrixSplash();
-  drawMenu();
+
+  // Check for saved name — first run goes to wizard
+  if (identityExists()) {
+    identityLoad();
+    Serial.printf("Name: %s\n", userName);
+    drawMenu();
+  } else {
+    Serial.println("No name set — entering setup wizard");
+    osState = STATE_WIZARD;
+    memset(wizardBuf, 0, sizeof(wizardBuf));
+    wizardCursor = 0;
+    drawWizard();
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1662,6 +1881,8 @@ void loop() {
         } else {
           activeApp->onButton(i);
         }
+      } else if (osState == STATE_WIZARD) {
+        wizardHandleButton(i);
       }
     }
   }
