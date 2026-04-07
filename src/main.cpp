@@ -78,7 +78,7 @@ bool needsRedraw = true;
 //  COLORS (RGB565)
 // ═══════════════════════════════════════════════════════════
 #define COL_BG         TFT_BLACK
-#define COL_PURPLE     0xB81F   // CrowS brand purple
+#define COL_PURPLE     0x7A95   // CrowS brand purple (#7b52ab)
 #define COL_TITLE      COL_PURPLE
 #define COL_SEL_TEXT   TFT_BLACK
 #define COL_UNSEL      0x8410   // medium gray
@@ -90,6 +90,7 @@ bool needsRedraw = true;
 #define COL_BAT_CRIT   TFT_RED
 #define COL_ACCENT     COL_PURPLE
 #define COL_PANIC      TFT_RED
+#define COL_PEER       0xED08   // warm amber for incoming senders
 
 // Runtime theme color — purple normally, red in Panic Mode
 uint16_t colTheme = COL_PURPLE;
@@ -103,7 +104,7 @@ char panicSender[16]   = {0};
 unsigned long panicActivateTime = 0;  // when panic was activated
 unsigned long panicLastTx       = 0;
 unsigned long panicDismissTime  = 0;  // cooldown after dismissing alert
-#define PANIC_BEACON_MS    3000       // broadcast interval
+#define PANIC_BEACON_MS    1500       // broadcast interval (rescue proximity)
 #define PANIC_HOLD_MS      5000       // long-press duration to activate/deactivate
 #define PANIC_HINT_DELAY   600000UL   // 10 min before showing deactivation hint
 #define PANIC_ALERT_COOLDOWN 60000    // don't re-alert same sender for 60s
@@ -208,17 +209,17 @@ void loraInit() {
   radioMod = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, spi);
   radio = new LLCC68(radioMod);
 
-  // 868 MHz, 125 kHz BW, SF9, CR 4/7, private sync, 10 dBm, 8-sym preamble
+  // 868 MHz, 125 kHz BW, SF9, CR 4/7, private sync, 22 dBm, 8-sym preamble
   // tcxoVoltage=0 (module uses crystal, not TCXO), DC-DC regulator (not LDO)
   Serial.println("[LoRa] initializing...");
   int16_t state = radio->begin(868.0, 125.0, 9, 7,
                                 RADIOLIB_SX126X_SYNC_WORD_PRIVATE,
-                                10, 8, 0.0, false);
+                                22, 8, 0.0, false);
   if (state == RADIOLIB_ERR_NONE) {
     radio->setDio1Action(loraOnDio1);
     radio->startReceive();
     loraReady = true;
-    Serial.println("[LoRa] init OK — 868 MHz, SF9, 125 kHz");
+    Serial.println("[LoRa] init OK — 868 MHz, SF9, 125 kHz, 22 dBm");
   } else {
     Serial.printf("[LoRa] init FAILED (code %d)\n", state);
   }
@@ -267,6 +268,7 @@ struct PeerKey {
   uint8_t pubKey[32];
   uint8_t sharedKey[32];  // derived: X25519(myPriv, peerPub) → BLAKE2b
   bool    hasSharedKey;
+  unsigned long lastKex;  // millis() of last KEX received (0 = never/boot)
 };
 
 PeerKey peers[PEER_MAX];
@@ -279,7 +281,7 @@ static size_t b64_decode(uint8_t* out, const char* in, size_t inLen);
 // ── Process received packet (called from loop) ──
 // Forward declaration — Shine Finder proximity tracking
 void shineUpdate(const char* name, float rssi, float snr);
-bool kexHandlePacket(const String& raw);
+bool kexHandlePacket(const String& raw, float snr);
 
 // Returns true if a valid CrowS CHAT message was received
 bool loraReceive() {
@@ -344,7 +346,7 @@ bool loraReceive() {
 
   // ── KEX beacon: "KEX:sender:pubkey_b64" ──
   if (raw.startsWith("KEX:")) {
-    kexHandlePacket(raw);
+    kexHandlePacket(raw, rxSNR);
     return false;
   }
 
@@ -795,6 +797,14 @@ static size_t b64_decode(uint8_t* out, const char* in, size_t inLen) {
 // Peers discovered via KEX: packets, persisted in NVS.
 
 #define KEX_BEACON_MS 30000  // broadcast own pubkey every 30s
+#define PEER_STALE_MS 180000 // 3 min — prune peers with no KEX
+#define KEX_MIN_SNR   -5.0f  // reject KEX below this SNR (likely corrupted)
+#define TOFU_CONFIRM   2     // consecutive clean KEX required for key change
+
+// Pending TOFU key change — requires TOFU_CONFIRM consecutive matching KEX
+static uint8_t  tofuPendingKey[32];
+static char     tofuPendingName[16];
+static int      tofuPendingCount = 0;
 
 PeerKey* peerLookup(const char* name) {
   for (int i = 0; i < peerCount; i++) {
@@ -824,6 +834,7 @@ bool peerAdd(const char* name, const uint8_t* pubKey) {
     Serial.printf("[CRYPTO] TOFU: %s key CHANGED — accepting new key\n", name);
     memcpy(existing->pubKey, pubKey, 32);
     peerDeriveSharedKey(existing);
+    existing->lastKex = millis();
     return true;
   }
 
@@ -841,6 +852,7 @@ bool peerAdd(const char* name, const uint8_t* pubKey) {
   p->name[15] = '\0';
   memcpy(p->pubKey, pubKey, 32);
   peerDeriveSharedKey(p);
+  p->lastKex = millis();
   peerCount++;
 
   Serial.printf("[CRYPTO] Peer added: %s (pubkey: %02x%02x%02x%02x...) — %d peers total\n",
@@ -862,6 +874,28 @@ void peerSaveAll() {
   Serial.printf("[NVS] Saved %d peers\n", peerCount);
 }
 
+// Remove peers that haven't sent KEX within PEER_STALE_MS.
+// Returns true if any were pruned (caller should peerSaveAll).
+bool peerPruneStale() {
+  unsigned long now = millis();
+  bool pruned = false;
+  for (int i = peerCount - 1; i >= 0; i--) {
+    if (peers[i].lastKex == 0) continue;
+    if (now - peers[i].lastKex > PEER_STALE_MS) {
+      Serial.printf("[CRYPTO] Pruning stale peer: %s (no KEX for %lus)\n",
+                    peers[i].name, (now - peers[i].lastKex) / 1000);
+      crypto_wipe(peers[i].sharedKey, 32);
+      crypto_wipe(peers[i].pubKey, 32);
+      if (i < peerCount - 1) {
+        memmove(&peers[i], &peers[i + 1], sizeof(PeerKey) * (peerCount - 1 - i));
+      }
+      peerCount--;
+      pruned = true;
+    }
+  }
+  return pruned;
+}
+
 void peerLoadAll() {
   prefs.begin("crows", true);
   peerCount = prefs.getInt("peerCount", 0);
@@ -879,8 +913,11 @@ void peerLoadAll() {
   prefs.end();
 
   // Derive shared keys for all loaded peers
+  unsigned long now = millis();
   for (int i = 0; i < peerCount; i++) {
     peerDeriveSharedKey(&peers[i]);
+    peers[i].lastKex = now;  // grace period — assume live until proven stale
+    Serial.printf("[CRYPTO]   peer[%d]: %s\n", i, peers[i].name);
   }
   Serial.printf("[CRYPTO] Loaded %d peers from NVS\n", peerCount);
 }
@@ -903,8 +940,14 @@ void kexSendBeacon() {
 }
 
 // Handle received KEX packet — returns true if processed
-bool kexHandlePacket(const String& raw) {
+bool kexHandlePacket(const String& raw, float snr) {
   if (!raw.startsWith("KEX:")) return false;
+
+  // SNR floor — reject noisy packets that are likely corrupted
+  if (snr < KEX_MIN_SNR) {
+    Serial.printf("[KEX] Rejected (SNR %.1f below %.1f threshold)\n", snr, KEX_MIN_SNR);
+    return false;
+  }
 
   // Parse: KEX:sender:pubkey_b64
   int s1 = 4;                       // after "KEX:"
@@ -930,10 +973,50 @@ bool kexHandlePacket(const String& raw) {
     return false;
   }
 
-  // Add or update peer — saves to NVS if changed
+  // TOFU hardening — if this peer exists but key changed, require
+  // TOFU_CONFIRM consecutive matching KEX before accepting the new key.
+  PeerKey* existing = peerLookup(sender.c_str());
+  if (existing && memcmp(existing->pubKey, peerPub, 32) != 0) {
+    // Key mismatch — this is a TOFU change candidate
+    if (strcmp(tofuPendingName, sender.c_str()) == 0 &&
+        memcmp(tofuPendingKey, peerPub, 32) == 0) {
+      tofuPendingCount++;
+      Serial.printf("[KEX] TOFU pending for %s (%d/%d confirmations)\n",
+                    sender.c_str(), tofuPendingCount, TOFU_CONFIRM);
+    } else {
+      // New candidate — start fresh
+      strncpy(tofuPendingName, sender.c_str(), 15);
+      tofuPendingName[15] = '\0';
+      memcpy(tofuPendingKey, peerPub, 32);
+      tofuPendingCount = 1;
+      Serial.printf("[KEX] TOFU candidate from %s (1/%d)\n",
+                    sender.c_str(), TOFU_CONFIRM);
+    }
+    if (tofuPendingCount >= TOFU_CONFIRM) {
+      Serial.printf("[CRYPTO] TOFU confirmed: %s key changed (after %d clean KEX)\n",
+                    sender.c_str(), tofuPendingCount);
+      memcpy(existing->pubKey, peerPub, 32);
+      peerDeriveSharedKey(existing);
+      existing->lastKex = millis();
+      tofuPendingCount = 0;
+      peerSaveAll();
+    }
+    // Update liveness even while pending
+    existing->lastKex = millis();
+    if (peerPruneStale()) peerSaveAll();
+    return false;
+  }
+
+  // Normal path: new peer or same key
   if (peerAdd(sender.c_str(), peerPub)) {
     peerSaveAll();
   }
+  // Always update liveness (even if key unchanged)
+  PeerKey* p = peerLookup(sender.c_str());
+  if (p) p->lastKex = millis();
+
+  // Prune peers that haven't sent KEX recently
+  if (peerPruneStale()) peerSaveAll();
 
   return false;  // not a chat message — don't trigger inbox notification
 }
@@ -947,10 +1030,12 @@ bool kexHandlePacket(const String& raw) {
 bool loraSendEncrypted(const char* text) {
   if (!loraReady || !text[0]) return false;
 
-  // Find first peer with a shared key
+  // Find most recently active peer with a shared key
   PeerKey* peer = NULL;
   for (int i = 0; i < peerCount; i++) {
-    if (peers[i].hasSharedKey) { peer = &peers[i]; break; }
+    if (peers[i].hasSharedKey) {
+      if (!peer || peers[i].lastKex > peer->lastKex) peer = &peers[i];
+    }
   }
   if (!peer) {
     Serial.println("[CRYPTO] No peers with shared key — sending plaintext");
@@ -1114,7 +1199,7 @@ void drawEmergencyHoldProgress() {
   canvas->setTextSize(1);
   canvas->setTextColor(TFT_RED);
   canvas->setCursor(10, SCREEN_H - 18);
-  canvas->print("Hold X to WIPE...");
+  canvas->print("Hold # to WIPE...");
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1193,7 +1278,7 @@ int getBatteryMV() {
 #define SPLASH_HOLD_MS 1200  // ms hold after fill complete
 
 #define COL_SILHOUETTE  0x2945  // dark gray unfilled feather
-#define COL_MENISCUS    0xD41F  // bright purple-pink fill edge
+#define COL_MENISCUS    0xB49B  // light purple fill edge
 
 static const uint8_t FEATHER_BITMAP[FEATHER_H * 3] PROGMEM = {
   0x00, 0x00, 0x10,  // row 0  (tip)
@@ -2415,7 +2500,7 @@ void msg_drawInbox() {
       int row_y = y + i * 30;
 
       // Sender label
-      canvas->setTextColor(m->outgoing ? colTheme : TFT_GREEN);
+      canvas->setTextColor(m->outgoing ? colTheme : COL_PEER);
       canvas->setCursor(4, row_y);
       if (m->outgoing) {
         canvas->print("You");
@@ -3208,7 +3293,7 @@ void drawMenu() {
       int idx = catScroll + i;
       int y = MENU_TOP + i * MENU_ITEM_H;
       if (idx == catSel) {
-        uint16_t hlCol = panicActive ? COL_PANIC : categories[idx].color;
+        uint16_t hlCol = panicActive ? COL_PANIC : colTheme;
         canvas->fillRect(MENU_PAD_X, y, SCREEN_W - MENU_PAD_X * 2, MENU_ITEM_H - 2, hlCol);
         canvas->setTextColor(COL_SEL_TEXT);
       } else {
@@ -3250,7 +3335,7 @@ void drawMenu() {
       int idx = menuScroll + i;
       int y = MENU_TOP + i * MENU_ITEM_H;
       if (idx == menuSel) {
-        uint16_t hlCol = panicActive ? COL_PANIC : cat->apps[idx].color;
+        uint16_t hlCol = panicActive ? COL_PANIC : colTheme;
         canvas->fillRect(MENU_PAD_X, y, SCREEN_W - MENU_PAD_X * 2, MENU_ITEM_H - 2, hlCol);
         canvas->setTextColor(COL_SEL_TEXT);
       } else {
@@ -3446,8 +3531,8 @@ void loop() {
       holdStart_9 = 0;
     }
 
-    // BTN_BACK (X): hold 7s on top-level menu to EMERGENCY CLEAR
-    bool backHeld = !(cur & (1 << BTN_BACK));
+    // BTN_HASH (#): hold 7s on top-level menu to EMERGENCY CLEAR
+    bool backHeld = !(cur & (1 << BTN_HASH));
     if (backHeld && osState == STATE_MENU && menuLevel == 0) {
       if (holdStart_back == 0) holdStart_back = millis();
       if (millis() - holdStart_back >= EMERGENCY_HOLD_MS) {

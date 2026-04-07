@@ -32,7 +32,7 @@ CrowS replaces this with actual cryptography:
 ### Rescue Mode (SOS)
 - **Panic Mode** — hold `*` for 5 seconds from any screen to broadcast SOS
 - **Receiving devices lock into rescue mode** — Shine Finder proximity tracker with audio tone, locked UI, auto-exit after 30s without signal
-- **Emergency Clear** — hold `X` (BACK) for 7 seconds to wipe all data, keys, and identity
+- **Emergency Clear** — hold `#` (emoji) for 7 seconds to wipe all data, keys, and identity
 
 ### OS
 - **Feather boot splash** — hand-drawn pixel art crow feather, purple liquid fill animation
@@ -106,16 +106,16 @@ CrowS/
 
 ## Controls
 
-| Context         | Controls                                                   |
-| --------------- | ---------------------------------------------------------- |
-| Menu            | UP/DOWN navigate, ENTER select, BACK return                |
-| Compose         | T9 keypad to type, ENTER send, BACK backspace              |
-| Inbox           | UP/DOWN scroll messages, BACK exit                         |
-| ChatterTris     | 1=left, 2=rotate, 3=right, 4=hard drop, 6=soft drop       |
-| Music Player    | UP/DOWN select, ENTER play, BACK stop/exit                 |
-| Ghost Detector  | ENTER recalibrate, BACK exit                               |
-| Panic Mode      | Hold `*` 5s to activate, hold `9` 5s to deactivate        |
-| Emergency Clear | Hold BACK 7s on main menu — **wipes everything**          |
+| Context         | Controls                                            |
+| --------------- | --------------------------------------------------- |
+| Menu            | UP/DOWN navigate, ENTER select, BACK return         |
+| Compose         | T9 keypad to type, ENTER send, BACK backspace       |
+| Inbox           | UP/DOWN scroll messages, BACK exit                  |
+| ChatterTris     | 1=left, 2=rotate, 3=right, 4=hard drop, 6=soft drop |
+| Music Player    | UP/DOWN select, ENTER play, BACK stop/exit          |
+| Ghost Detector  | ENTER recalibrate, BACK exit                        |
+| Panic Mode      | Hold `*` 5s to activate, hold `9` 5s to deactivate  |
+| Emergency Clear | Hold  `#` 7s on main menu — **wipes everything**    |
 
 ## Build Stats (v0.6.0)
 
