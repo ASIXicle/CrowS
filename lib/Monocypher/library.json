@@ -1,0 +1,12 @@
+{
+  "name": "Monocypher",
+  "version": "4.0.2",
+  "description": "Compact crypto library - XChaCha20-Poly1305, X25519, BLAKE2b",
+  "license": "BSD-2-Clause",
+  "homepage": "https://monocypher.org/",
+  "frameworks": "*",
+  "platforms": "*",
+  "build": {
+    "flags": ["-DBLAKE2_NO_UNROLLING"]
+  }
+}

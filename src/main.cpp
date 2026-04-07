@@ -1,6 +1,6 @@
 /*
  * CrowS — Chatter Redesigned OS with Substance
- * v0.4.0: LoRa messaging (LLCC68, 868 MHz, RadioLib)
+ * v0.6.0: Monocypher crypto (X25519 keypair), WiFi/BT disabled
  *
  * Target:  CircuitMess Chatter 2.0
  *          ESP32-D0WD, ST7735S 160x128 TFT, 74HC165 shift register input
@@ -23,8 +23,10 @@
 #include <Loop/LoopManager.h>
 #include <Preferences.h>
 #include <RadioLib.h>
+#include <monocypher.h>
+#include <esp_bt.h>
 
-#define CROWS_VERSION "0.5.0"
+#define CROWS_VERSION "0.6.0"
 
 // ═══════════════════════════════════════════════════════════
 //  DISPLAY
@@ -105,6 +107,11 @@ unsigned long panicDismissTime  = 0;  // cooldown after dismissing alert
 #define PANIC_HOLD_MS      5000       // long-press duration to activate/deactivate
 #define PANIC_HINT_DELAY   600000UL   // 10 min before showing deactivation hint
 #define PANIC_ALERT_COOLDOWN 60000    // don't re-alert same sender for 60s
+
+// Rescue mode: Shine Finder activated by incoming PANIC
+bool rescueMode              = false;
+unsigned long rescueLastPanic = 0;
+#define RESCUE_TIMEOUT 30000   // exit rescue 30s after last PANIC beacon
 
 // Hold detection for * (activate) and 9 (deactivate)
 unsigned long holdStart_star = 0;
@@ -252,9 +259,27 @@ bool loraSend(const char* text) {
   }
 }
 
+// Peer key table (Phase 2) — declared here so cryptoWipeKeys() can reference
+#define PEER_MAX 8
+
+struct PeerKey {
+  char    name[16];
+  uint8_t pubKey[32];
+  uint8_t sharedKey[32];  // derived: X25519(myPriv, peerPub) → BLAKE2b
+  bool    hasSharedKey;
+};
+
+PeerKey peers[PEER_MAX];
+int     peerCount = 0;
+unsigned long kexLastTx = 0;
+
+PeerKey* peerLookup(const char* name);
+static size_t b64_decode(uint8_t* out, const char* in, size_t inLen);
+
 // ── Process received packet (called from loop) ──
 // Forward declaration — Shine Finder proximity tracking
 void shineUpdate(const char* name, float rssi, float snr);
+bool kexHandlePacket(const String& raw);
 
 // Returns true if a valid CrowS CHAT message was received
 bool loraReceive() {
@@ -282,13 +307,19 @@ bool loraReceive() {
       bool isSelf = (strcmp(who.c_str(), userName) == 0)
                  || (who.indexOf(userName) >= 0)
                  || (String(userName).indexOf(who) >= 0);
-      if (!isSelf && !panicAlert) {
-        // Cooldown check: don't re-alert if recently dismissed
-        if (millis() - panicDismissTime >= PANIC_ALERT_COOLDOWN) {
-          panicAlert = true;
+      if (!isSelf) {
+        rescueLastPanic = millis();
+        if (!rescueMode) {
+          rescueMode = true;
           strncpy(panicSender, who.c_str(), sizeof(panicSender) - 1);
           panicSender[sizeof(panicSender) - 1] = '\0';
-          Serial.printf("[PANIC] SOS from %s!\n", panicSender);
+          // Initial siren burst (3 quick chirps)
+          for (int i = 0; i < 3; i++) {
+            ledcWriteTone(0, 1200); delay(100);
+            ledcWriteTone(0, 800);  delay(100);
+          }
+          ledcWriteTone(0, 0);
+          Serial.printf("[RESCUE] SOS from %s — entering rescue mode\n", panicSender);
         }
       }
     }
@@ -309,6 +340,68 @@ bool loraReceive() {
       }
     }
     return false;  // not a chat message
+  }
+
+  // ── KEX beacon: "KEX:sender:pubkey_b64" ──
+  if (raw.startsWith("KEX:")) {
+    kexHandlePacket(raw);
+    return false;
+  }
+
+  // ── Encrypted chat: "ECROWS:sender:nonce_b64:payload_b64" ──
+  if (raw.startsWith("ECROWS:")) {
+    int s1 = 7;                          // after "ECROWS:"
+    int s2 = raw.indexOf(':', s1);       // end of sender
+    int s3 = raw.indexOf(':', s2 + 1);   // end of nonce
+    if (s2 < 0 || s3 < 0) return false;
+
+    String sender  = raw.substring(s1, s2);
+    String nonceB64 = raw.substring(s2 + 1, s3);
+    String payB64   = raw.substring(s3 + 1);
+
+    // Self-filter
+    if (strcmp(sender.c_str(), userName) == 0) return false;
+
+    // Look up peer shared key
+    PeerKey* peer = peerLookup(sender.c_str());
+    if (!peer || !peer->hasSharedKey) {
+      Serial.printf("[ECROWS] No key for %s — dropping\n", sender.c_str());
+      return false;
+    }
+
+    // Decode nonce (24 bytes)
+    uint8_t nonce[24];
+    if (b64_decode(nonce, nonceB64.c_str(), nonceB64.length()) != 24) {
+      Serial.println("[ECROWS] Bad nonce");
+      return false;
+    }
+
+    // Decode payload: mac[16] + ciphertext[N]
+    uint8_t payload[16 + MSG_TEXT_LEN + 4];  // extra guard bytes
+    size_t payLen = b64_decode(payload, payB64.c_str(), payB64.length());
+    if (payLen < 17) {  // minimum: 16 mac + 1 byte ciphertext
+      Serial.println("[ECROWS] Payload too short");
+      return false;
+    }
+
+    uint8_t* mac = payload;
+    uint8_t* ciphertext = payload + 16;
+    size_t ctLen = payLen - 16;
+
+    // Decrypt + verify
+    uint8_t plaintext[MSG_TEXT_LEN + 1];
+    if (crypto_aead_unlock(plaintext, mac,
+                           peer->sharedKey, nonce,
+                           NULL, 0,
+                           ciphertext, ctLen) != 0) {
+      Serial.println("[ECROWS] Decryption FAILED — tampered or wrong key");
+      return false;
+    }
+
+    plaintext[ctLen] = '\0';
+    Serial.printf("[ECROWS] Decrypted from %s: %s\n", sender.c_str(), (char*)plaintext);
+    msgPush(sender.c_str(), (char*)plaintext, false);
+    return true;
   }
 
   // ── Chat message: "CROWS:sender:text" ──
@@ -531,6 +624,391 @@ void identitySave(const char* name) {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  CRYPTO — X25519 keypair via Monocypher, stored in NVS
+// ═══════════════════════════════════════════════════════════
+// Phase 1: Key generation + NVS storage.
+// Private key → NVS "privKey" (32 bytes)
+// Public key  → NVS "pubKey"  (32 bytes)
+// Wiped on Reset Name and Emergency Clear (fresh identity = fresh keys).
+
+uint8_t myPrivKey[32] = {0};
+uint8_t myPubKey[32]  = {0};
+bool    cryptoReady   = false;
+
+// Forward declarations for ECROWS handler in loraReceive()
+PeerKey* peerLookup(const char* name);
+static size_t b64_decode(uint8_t* out, const char* in, size_t inLen);
+
+// Fill buffer with hardware RNG (ESP32 TRNG via esp_random)
+static void cryptoRandBytes(uint8_t* buf, size_t len) {
+  for (size_t i = 0; i < len; i += 4) {
+    uint32_t r = esp_random();
+    size_t chunk = (len - i < 4) ? (len - i) : 4;
+    memcpy(buf + i, &r, chunk);
+  }
+}
+
+void cryptoGenerateKeys() {
+  // Generate random 32-byte private key, derive public key
+  cryptoRandBytes(myPrivKey, 32);
+  crypto_x25519_public_key(myPubKey, myPrivKey);
+
+  // Store in NVS
+  prefs.begin("crows", false);
+  prefs.putBytes("privKey", myPrivKey, 32);
+  prefs.putBytes("pubKey", myPubKey, 32);
+  prefs.end();
+
+  cryptoReady = true;
+
+  // Log public key fingerprint (first 4 bytes hex)
+  Serial.printf("[CRYPTO] New keypair generated — pubkey: %02x%02x%02x%02x...\n",
+                myPubKey[0], myPubKey[1], myPubKey[2], myPubKey[3]);
+}
+
+void cryptoLoadKeys() {
+  prefs.begin("crows", true);
+  size_t privLen = prefs.getBytes("privKey", myPrivKey, 32);
+  size_t pubLen  = prefs.getBytes("pubKey",  myPubKey,  32);
+  prefs.end();
+
+  if (privLen == 32 && pubLen == 32) {
+    cryptoReady = true;
+    Serial.printf("[CRYPTO] Keypair loaded — pubkey: %02x%02x%02x%02x...\n",
+                  myPubKey[0], myPubKey[1], myPubKey[2], myPubKey[3]);
+  } else {
+    Serial.println("[CRYPTO] NVS keys corrupt or missing — regenerating");
+    cryptoGenerateKeys();
+  }
+}
+
+void cryptoWipeKeys() {
+  crypto_wipe(myPrivKey, 32);
+  crypto_wipe(myPubKey, 32);
+  cryptoReady = false;
+
+  // Wipe peer shared keys from RAM
+  for (int i = 0; i < peerCount; i++) {
+    crypto_wipe(peers[i].sharedKey, 32);
+    crypto_wipe(peers[i].pubKey, 32);
+  }
+  peerCount = 0;
+
+  prefs.begin("crows", false);
+  prefs.remove("privKey");
+  prefs.remove("pubKey");
+  prefs.putInt("peerCount", 0);
+  for (int i = 0; i < PEER_MAX; i++) {
+    char kn[16], kk[16];
+    snprintf(kn, sizeof(kn), "peer_%d_name", i);
+    snprintf(kk, sizeof(kk), "peer_%d_key", i);
+    prefs.remove(kn);
+    prefs.remove(kk);
+  }
+  prefs.end();
+
+  Serial.println("[CRYPTO] All keys + peers wiped");
+}
+
+void cryptoInit() {
+  prefs.begin("crows", true);
+  uint8_t tmp[1];
+  bool hasKey = (prefs.getBytes("privKey", tmp, 1) > 0);
+  prefs.end();
+
+  if (hasKey) {
+    cryptoLoadKeys();
+  } else {
+    Serial.println("[CRYPTO] No keypair found — generating on first boot");
+    cryptoGenerateKeys();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  BASE64 — minimal encode/decode for 32-byte keys
+// ═══════════════════════════════════════════════════════════
+static const char b64_table[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Encode `len` bytes into null-terminated base64 string.
+// `out` must be at least ((len+2)/3)*4 + 1 bytes.
+static void b64_encode(char* out, const uint8_t* in, size_t len) {
+  size_t i = 0, j = 0;
+  size_t rem = len % 3;
+  size_t full = len - rem;
+  // Full 3-byte groups
+  for (i = 0; i < full; i += 3) {
+    uint32_t triple = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8) | in[i+2];
+    out[j++] = b64_table[(triple >> 18) & 0x3F];
+    out[j++] = b64_table[(triple >> 12) & 0x3F];
+    out[j++] = b64_table[(triple >>  6) & 0x3F];
+    out[j++] = b64_table[ triple        & 0x3F];
+  }
+  // Remaining 1 or 2 bytes
+  if (rem == 1) {
+    uint32_t triple = (uint32_t)in[i] << 16;
+    out[j++] = b64_table[(triple >> 18) & 0x3F];
+    out[j++] = b64_table[(triple >> 12) & 0x3F];
+    out[j++] = '=';
+    out[j++] = '=';
+  } else if (rem == 2) {
+    uint32_t triple = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8);
+    out[j++] = b64_table[(triple >> 18) & 0x3F];
+    out[j++] = b64_table[(triple >> 12) & 0x3F];
+    out[j++] = b64_table[(triple >>  6) & 0x3F];
+    out[j++] = '=';
+  }
+  out[j] = '\0';
+}
+
+// Decode base64 string into bytes. Returns number of bytes written.
+// `out` must be at least (strlen(in)/4)*3 bytes.
+static size_t b64_decode(uint8_t* out, const char* in, size_t inLen) {
+  // Build reverse table on first call
+  static uint8_t rev[128];
+  static bool rev_init = false;
+  if (!rev_init) {
+    memset(rev, 0xFF, sizeof(rev));
+    for (int k = 0; k < 64; k++) rev[(int)b64_table[k]] = k;
+    rev_init = true;
+  }
+
+  size_t j = 0;
+  for (size_t i = 0; i + 3 < inLen; i += 4) {
+    uint8_t a = rev[(int)in[i]   & 0x7F];
+    uint8_t b = rev[(int)in[i+1] & 0x7F];
+    uint8_t c = rev[(int)in[i+2] & 0x7F];
+    uint8_t d = rev[(int)in[i+3] & 0x7F];
+    if (a > 63 || b > 63) break;  // invalid
+    uint32_t triple = (a << 18) | (b << 12) | (c << 6) | d;
+    out[j++] = (triple >> 16) & 0xFF;
+    if (in[i+2] != '=') out[j++] = (triple >> 8) & 0xFF;
+    if (in[i+3] != '=') out[j++] = triple & 0xFF;
+  }
+  return j;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  PEER KEY MANAGEMENT — TOFU key exchange over LoRa
+// ═══════════════════════════════════════════════════════════
+// Stores up to PEER_MAX peers' public keys + precomputed shared keys.
+// Peers discovered via KEX: packets, persisted in NVS.
+
+#define KEX_BEACON_MS 30000  // broadcast own pubkey every 30s
+
+PeerKey* peerLookup(const char* name) {
+  for (int i = 0; i < peerCount; i++) {
+    if (strcmp(peers[i].name, name) == 0) return &peers[i];
+  }
+  return NULL;
+}
+
+// Derive symmetric key: X25519 raw shared secret → BLAKE2b-256
+static void peerDeriveSharedKey(PeerKey* peer) {
+  uint8_t raw[32];
+  crypto_x25519(raw, myPrivKey, peer->pubKey);
+  // Hash to get a uniformly distributed key (raw X25519 output isn't uniform)
+  crypto_blake2b(peer->sharedKey, 32, raw, 32);
+  crypto_wipe(raw, 32);
+  peer->hasSharedKey = true;
+}
+
+bool peerAdd(const char* name, const uint8_t* pubKey) {
+  // Check if already known
+  PeerKey* existing = peerLookup(name);
+  if (existing) {
+    if (memcmp(existing->pubKey, pubKey, 32) == 0) {
+      return false;  // same key, no change
+    }
+    // TOFU violation — key changed (device was reset). Accept new key.
+    Serial.printf("[CRYPTO] TOFU: %s key CHANGED — accepting new key\n", name);
+    memcpy(existing->pubKey, pubKey, 32);
+    peerDeriveSharedKey(existing);
+    return true;
+  }
+
+  // New peer
+  if (peerCount >= PEER_MAX) {
+    Serial.println("[CRYPTO] Peer table full — dropping oldest");
+    // Shift array: drop peers[0], move everything down
+    memmove(&peers[0], &peers[1], sizeof(PeerKey) * (PEER_MAX - 1));
+    peerCount = PEER_MAX - 1;
+  }
+
+  PeerKey* p = &peers[peerCount];
+  memset(p, 0, sizeof(PeerKey));
+  strncpy(p->name, name, 15);
+  p->name[15] = '\0';
+  memcpy(p->pubKey, pubKey, 32);
+  peerDeriveSharedKey(p);
+  peerCount++;
+
+  Serial.printf("[CRYPTO] Peer added: %s (pubkey: %02x%02x%02x%02x...) — %d peers total\n",
+                name, pubKey[0], pubKey[1], pubKey[2], pubKey[3], peerCount);
+  return true;
+}
+
+void peerSaveAll() {
+  prefs.begin("crows", false);
+  prefs.putInt("peerCount", peerCount);
+  for (int i = 0; i < peerCount; i++) {
+    char kn[16], kk[16];
+    snprintf(kn, sizeof(kn), "peer_%d_name", i);
+    snprintf(kk, sizeof(kk), "peer_%d_key", i);
+    prefs.putString(kn, peers[i].name);
+    prefs.putBytes(kk, peers[i].pubKey, 32);
+  }
+  prefs.end();
+  Serial.printf("[NVS] Saved %d peers\n", peerCount);
+}
+
+void peerLoadAll() {
+  prefs.begin("crows", true);
+  peerCount = prefs.getInt("peerCount", 0);
+  if (peerCount > PEER_MAX) peerCount = PEER_MAX;
+  for (int i = 0; i < peerCount; i++) {
+    char kn[16], kk[16];
+    snprintf(kn, sizeof(kn), "peer_%d_name", i);
+    snprintf(kk, sizeof(kk), "peer_%d_key", i);
+    String n = prefs.getString(kn, "");
+    strncpy(peers[i].name, n.c_str(), 15);
+    peers[i].name[15] = '\0';
+    prefs.getBytes(kk, peers[i].pubKey, 32);
+    peers[i].hasSharedKey = false;
+  }
+  prefs.end();
+
+  // Derive shared keys for all loaded peers
+  for (int i = 0; i < peerCount; i++) {
+    peerDeriveSharedKey(&peers[i]);
+  }
+  Serial.printf("[CRYPTO] Loaded %d peers from NVS\n", peerCount);
+}
+
+// Send KEX beacon: KEX:username:pubkey_b64
+void kexSendBeacon() {
+  if (!loraReady || !cryptoReady) return;
+  char pubB64[48];  // 44 chars + null
+  b64_encode(pubB64, myPubKey, 32);
+  char pkt[80];
+  snprintf(pkt, sizeof(pkt), "KEX:%s:%s", userName, pubB64);
+
+  radio->standby();
+  int16_t state = radio->transmit((uint8_t*)pkt, strlen(pkt));
+  radio->startReceive();
+
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.printf("[KEX] TX: %s\n", pkt);
+  }
+}
+
+// Handle received KEX packet — returns true if processed
+bool kexHandlePacket(const String& raw) {
+  if (!raw.startsWith("KEX:")) return false;
+
+  // Parse: KEX:sender:pubkey_b64
+  int s1 = 4;                       // after "KEX:"
+  int s2 = raw.indexOf(':', s1);    // end of sender name
+  if (s2 < 0) return false;
+
+  String sender = raw.substring(s1, s2);
+  String keyB64 = raw.substring(s2 + 1);
+
+  // Validate
+  if (sender.length() == 0 || sender.length() > 15) return false;
+  if (keyB64.length() < 40 || keyB64.length() > 48) return false;
+
+  // Self-filter
+  if (strcmp(sender.c_str(), userName) == 0) return false;
+
+  // Decode public key (with overflow guard)
+  uint8_t peerPub[36];  // extra room to detect over-long keys
+  size_t decoded = b64_decode(peerPub, keyB64.c_str(), keyB64.length());
+  if (decoded != 32) {
+    Serial.printf("[KEX] Bad pubkey from %s (decoded %d bytes)\n",
+                  sender.c_str(), decoded);
+    return false;
+  }
+
+  // Add or update peer — saves to NVS if changed
+  if (peerAdd(sender.c_str(), peerPub)) {
+    peerSaveAll();
+  }
+
+  return false;  // not a chat message — don't trigger inbox notification
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ENCRYPTED SEND — ECROWS:sender:nonce_b64:payload_b64
+// ═══════════════════════════════════════════════════════════
+// payload = mac[16] || ciphertext[N]
+// Falls back to plaintext if no peers with shared keys.
+
+bool loraSendEncrypted(const char* text) {
+  if (!loraReady || !text[0]) return false;
+
+  // Find first peer with a shared key
+  PeerKey* peer = NULL;
+  for (int i = 0; i < peerCount; i++) {
+    if (peers[i].hasSharedKey) { peer = &peers[i]; break; }
+  }
+  if (!peer) {
+    Serial.println("[CRYPTO] No peers with shared key — sending plaintext");
+    return loraSend(text);
+  }
+
+  // Generate 24-byte random nonce
+  uint8_t nonce[24];
+  cryptoRandBytes(nonce, 24);
+
+  // Encrypt: plaintext → mac[16] + ciphertext[ptLen]
+  size_t ptLen = strlen(text);
+  uint8_t mac[16];
+  uint8_t ciphertext[MSG_TEXT_LEN];
+  crypto_aead_lock(ciphertext, mac,
+                   peer->sharedKey, nonce,
+                   NULL, 0,                      // no additional data
+                   (const uint8_t*)text, ptLen);
+
+  // Concatenate mac + ciphertext for encoding
+  uint8_t payload[16 + MSG_TEXT_LEN];
+  memcpy(payload, mac, 16);
+  memcpy(payload + 16, ciphertext, ptLen);
+  size_t payloadLen = 16 + ptLen;
+
+  // Base64 encode nonce and payload
+  char nonce_b64[36];   // 24 bytes → 32 chars + null
+  char pay_b64[120];    // (16+64) bytes → max 108 chars + null
+  b64_encode(nonce_b64, nonce, 24);
+  b64_encode(pay_b64, payload, payloadLen);
+
+  // Build packet
+  char packet[256];
+  snprintf(packet, sizeof(packet), "ECROWS:%s:%s:%s",
+           userName, nonce_b64, pay_b64);
+
+  // Carrier sense + transmit
+  radio->standby();
+  float chRSSI = radio->getRSSI();
+  if (chRSSI > -90.0f) {
+    Serial.printf("[LoRa] Channel busy (RSSI %.1f), backing off 100ms\n", chRSSI);
+    delay(100);
+  }
+
+  int16_t state = radio->transmit((uint8_t*)packet, strlen(packet));
+  radio->startReceive();
+
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.printf("[ECROWS] TX OK → %s (%d bytes plaintext)\n", peer->name, ptLen);
+    loraLastChatTx = millis();
+    return true;
+  } else {
+    Serial.printf("[LoRa] TX FAIL (code %d)\n", state);
+    return false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
 //  MESSAGE PERSISTENCE — NVS blob storage
 // ═══════════════════════════════════════════════════════════
 // Stores entire inbox as a single blob (max ~1.6KB for 20 messages).
@@ -594,6 +1072,7 @@ extern int  t9_tapCount;
 void emergencyClear() {
   Serial.println("[EMERGENCY] === DEVICE WIPE ===");
   msgClearAll();
+  cryptoWipeKeys();
   identitySave("");
   userName[0] = '\0';
 
@@ -2096,7 +2575,7 @@ void msg_button(uint8_t id) {
 
     // ENTER = send
     if (id == BTN_ENTER && msgComposeCursor > 0) {
-      if (loraSend(msgComposeBuf)) {
+      if (loraSendEncrypted(msgComposeBuf)) {
         // Store in our inbox as outgoing
         msgPush(userName, msgComposeBuf, true);
         // Brief confirmation buzz
@@ -2194,11 +2673,16 @@ void shine_draw() {
   canvas->clear(COL_BG);
 
   // Header
-  canvas->fillRect(0, 0, SCREEN_W, 14, colTheme);
+  canvas->fillRect(0, 0, SCREEN_W, 14, rescueMode ? COL_PANIC : colTheme);
   canvas->setTextSize(1);
   canvas->setTextColor(TFT_WHITE);
   canvas->setCursor(5, 3);
-  canvas->print("SHINE FINDER");
+  if (rescueMode) {
+    canvas->print("!! SOS !! ");
+    canvas->print(panicSender);
+  } else {
+    canvas->print("SHINE FINDER");
+  }
 
   // Device count
   char countBuf[8];
@@ -2279,9 +2763,15 @@ void shine_draw() {
   }
 
   // Bottom hint
-  canvas->setTextColor(COL_HINT);
-  canvas->setCursor(30, 120);
-  canvas->print("BACK to exit");
+  canvas->setTextColor(rescueMode ? COL_PANIC : COL_HINT);
+  canvas->setCursor(rescueMode ? 16 : 30, 120);
+  if (rescueMode) {
+    canvas->print("LOCATING ");
+    canvas->print(panicSender);
+    canvas->print("...");
+  } else {
+    canvas->print("BACK to exit");
+  }
 
   needsRedraw = true;
 }
@@ -2437,6 +2927,7 @@ void settings_button(uint8_t id) {
   if (id == BTN_ENTER && settingsSel == 1) {
     // Clear name and messages, go to wizard
     msgClearAll();
+    cryptoWipeKeys();
     identitySave("");
     userName[0] = '\0';
     if (activeApp) activeApp->onStop();
@@ -2462,7 +2953,6 @@ CrowSApp gamesApps[] = {
 
 CrowSApp appsApps[] = {
   { "Ghost Detector", TFT_GREEN,  magOnStart,     magOnTick,     magOnButton,     magOnBack,     magOnStop     },
-  { "Shine Finder",   TFT_YELLOW, shine_start,    shine_tick,    shine_button,    shine_back,    shine_stop    },
   { "Music",          TFT_CYAN,   musicOnStart,   musicOnTick,   musicOnButton,   musicOnBack,   musicOnStop   },
 };
 
@@ -2477,7 +2967,7 @@ CrowSApp systemApps[] = {
 #define CAT_COUNT 4
 CrowSCategory categories[CAT_COUNT] = {
   { "Games",     TFT_CYAN,    gamesApps,     1 },
-  { "Apps",      TFT_GREEN,   appsApps,      3 },
+  { "Apps",      TFT_GREEN,   appsApps,      2 },
   { "Messaging", TFT_MAGENTA, messagingApps, 1 },
   { "System",    TFT_YELLOW,  systemApps,    1 },
 };
@@ -2562,6 +3052,7 @@ void wizardHandleButton(uint8_t btnId) {
   // Confirm (need at least 2 chars)
   if (btnId == BTN_ENTER && wizardCursor >= 2) {
     identitySave(wizardBuf);
+    cryptoGenerateKeys();  // Fresh identity = fresh keypair
     osState = STATE_MENU;
     drawMenu();
     return;
@@ -2817,6 +3308,12 @@ void setup() {
   randomSeed(analogRead(0) ^ (micros() << 16));
 
   Chatter.begin();
+
+  // Disable WiFi and Bluetooth — CrowS uses LoRa only.
+  // Must run after Chatter.begin() so subsystems are initialized.
+  btStop();
+  esp_bt_mem_release(ESP_BT_MODE_BTDM);  // Frees ~30KB RAM
+  Serial.println("[RADIO] BT disabled + memory released");
   buzzerInit();
   loraInit();
   backlightInit();   // PWM backlight on GPIO 32 (overrides Chatter's digitalWrite)
@@ -2836,6 +3333,8 @@ void setup() {
   if (identityExists()) {
     identityLoad();
     msgLoad();
+    cryptoInit();
+    peerLoadAll();
     Serial.printf("Name: %s\n", userName);
     drawMenu();
   } else {
@@ -2853,38 +3352,54 @@ void setup() {
 void loop() {
   LoopManager::loop();
 
-  // ── Panic alert overlay: takes over the entire screen ──
-  if (panicAlert) {
-    panicDrawAlert();
-    needsRedraw = true;
+  // ── Rescue mode: Shine Finder activated by incoming PANIC ──
+  if (rescueMode) {
+    // Check timeout — exit if no PANIC beacon for 30s
+    if (millis() - rescueLastPanic > RESCUE_TIMEOUT) {
+      rescueMode = false;
+      ledcWriteTone(0, 0);
+      Serial.printf("[RESCUE] %s panic resolved — exiting rescue\n", panicSender);
+      // Resolution tone: descending
+      ledcWriteTone(0, 800); delay(100);
+      ledcWriteTone(0, 600); delay(100);
+      ledcWriteTone(0, 400); delay(150);
+      ledcWriteTone(0, 0);
+      // Restore screen
+      if (osState == STATE_MENU) drawMenu();
+      else if (osState == STATE_APP && activeApp) activeApp->onStart();
+      needsRedraw = true;
+    } else {
+      // Render rescue Shine Finder
+      shinePurge();
+      shine_draw();
 
-    // Siren: alternating tones ~200ms cycle
-    if ((millis() / 200) % 2 == 0)
-      ledcWriteTone(0, 800);
-    else
-      ledcWriteTone(0, 1200);
-
-    // Any button press dismisses
-    if (millis() - lastPoll >= POLL_MS) {
-      lastPoll = millis();
-      uint16_t cur = readButtons();
-      uint16_t pressed = prevButtons & ~cur;
-      prevButtons = cur;
-      if (pressed) {
-        panicAlert = false;
-        panicDismissTime = millis();
-        ledcWriteTone(0, 0);
-        Serial.printf("[PANIC] Alert from %s dismissed\n", panicSender);
-        // Redraw whatever was on screen
-        if (osState == STATE_MENU) drawMenu();
-        else if (osState == STATE_APP && activeApp) { activeApp->onStart(); }
-        needsRedraw = true;
+      // Proximity tone for closest device
+      if (shineCount > 0) {
+        shineSort();
+        int pitch = shineTonePitch(shineDevices[0].rssi);
+        if (pitch > 0) {
+          ledcWriteTone(0, pitch);
+          delay(30);
+          ledcWriteTone(0, 0);
+        }
       }
+
+      // Consume button presses (locked — can't dismiss)
+      if (millis() - lastPoll >= POLL_MS) {
+        lastPoll = millis();
+        uint16_t cur = readButtons();
+        prevButtons = cur;  // swallow all input
+      }
+
+      needsRedraw = true;
     }
 
     if (needsRedraw) { display->commit(); needsRedraw = false; }
-    return;  // skip everything else while alert is showing
+    // Don't return — let LoRa receive and beacons continue below
   }
+
+  // ── Normal input + app processing (suppressed during rescue) ──
+  if (!rescueMode) {
 
   if (millis() - lastPoll >= POLL_MS) {
     lastPoll = millis();
@@ -3018,16 +3533,20 @@ void loop() {
   if (osState == STATE_APP && activeApp)
     activeApp->onTick();
 
-  // ── Background LoRa receive (runs in ALL states) ──
+  } // end if (!rescueMode)
+
+  // ── Background LoRa receive (runs in ALL states, including rescue) ──
   if (loraReceive()) {
-    // New message arrived — notification beep (two short chirps)
-    ledcWriteTone(0, 1500);
-    delay(60);
-    ledcWriteTone(0, 0);
-    delay(40);
-    ledcWriteTone(0, 1500);
-    delay(60);
-    ledcWriteTone(0, 0);
+    // New message arrived — notification beep (suppress during rescue)
+    if (!rescueMode) {
+      ledcWriteTone(0, 1500);
+      delay(60);
+      ledcWriteTone(0, 0);
+      delay(40);
+      ledcWriteTone(0, 1500);
+      delay(60);
+      ledcWriteTone(0, 0);
+    }
 
     // If we're currently viewing the inbox, refresh it
     if (osState == STATE_APP && activeApp &&
@@ -3039,14 +3558,15 @@ void loop() {
   }
 
   // ── Background beacon broadcast (runs in ALL states) ──
-  // Suppressed during Panic Mode (panic beacons replace SHINE)
-  // Suppressed briefly after chat TX (chat priority)
+  // SHINE beacons removed — only broadcast during Panic Mode for rescue tracking.
+  // KEX beacons continue for key exchange.
   if (loraReady && !panicActive) {
     unsigned long now = millis();
     bool chatWindow = (now - loraLastChatTx < LORA_CHAT_PRIORITY_MS);
-    if (!chatWindow && now - shineLastTx >= SHINE_BEACON_MS + (unsigned long)(random(1000))) {
-      shineLastTx = now;
-      shineSendBeacon();
+    // KEX beacon: broadcast public key every 30s (separate from SHINE)
+    if (!chatWindow && cryptoReady && now - kexLastTx >= KEX_BEACON_MS + (unsigned long)(random(2000))) {
+      kexLastTx = now;
+      kexSendBeacon();
     }
   }
 
@@ -3056,6 +3576,7 @@ void loop() {
     if (now - panicLastTx >= PANIC_BEACON_MS) {
       panicLastTx = now;
       panicSendBeacon();
+      shineSendBeacon();  // SHINE for rescue proximity tracking
     }
   }
 
