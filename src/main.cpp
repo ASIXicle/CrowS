@@ -171,6 +171,13 @@ struct CrowSMsg {
 CrowSMsg  msgInbox[MSG_MAX];
 int       msgCount = 0;        // total stored (0..MSG_MAX)
 
+// LoRa TX timing — used for chat priority over beacons
+unsigned long loraLastChatTx = 0;
+#define LORA_CHAT_PRIORITY_MS 500  // suppress beacons for 500ms after chat TX
+
+// Forward declaration — message persistence
+void msgSave();
+
 // Push a message into the inbox (drops oldest if full)
 void msgPush(const char* sender, const char* text, bool outgoing) {
   if (msgCount >= MSG_MAX) {
@@ -185,6 +192,7 @@ void msgPush(const char* sender, const char* text, bool outgoing) {
   m->text[MSG_TEXT_LEN - 1] = '\0';
   m->outgoing = outgoing;
   msgCount++;
+  msgSave();  // persist to NVS
 }
 
 // ── Radio init ──
@@ -221,8 +229,14 @@ bool loraSend(const char* text) {
   char packet[128];
   snprintf(packet, sizeof(packet), "%s:%s:%s", MSG_PROTO, userName, text);
 
-  // Must stop receiving to transmit
+  // Carrier sense: if channel is busy, back off and retry once
   radio->standby();
+  float chRSSI = radio->getRSSI();
+  if (chRSSI > -90.0f) {
+    Serial.printf("[LoRa] Channel busy (RSSI %.1f), backing off 100ms\n", chRSSI);
+    delay(100);
+  }
+
   int16_t state = radio->transmit((uint8_t*)packet, strlen(packet));
 
   // Always restart receive after transmit
@@ -230,6 +244,7 @@ bool loraSend(const char* text) {
 
   if (state == RADIOLIB_ERR_NONE) {
     Serial.printf("[LoRa] TX OK: %s\n", packet);
+    loraLastChatTx = millis();  // chat priority window
     return true;
   } else {
     Serial.printf("[LoRa] TX FAIL (code %d)\n", state);
@@ -324,7 +339,7 @@ bool loraReceive() {
 
 #define SHINE_MAX        8
 #define SHINE_TIMEOUT    10000  // ms — device removed if not heard
-#define SHINE_BEACON_MS  5000   // ms between background beacon broadcasts
+#define SHINE_BEACON_MS  12000  // ms between background beacon broadcasts
 
 struct ShineDevice {
   char  name[MSG_NAME_LEN];
@@ -513,6 +528,114 @@ void identitySave(const char* name) {
   prefs.end();
   strncpy(userName, name, 15);
   userName[15] = '\0';
+}
+
+// ═══════════════════════════════════════════════════════════
+//  MESSAGE PERSISTENCE — NVS blob storage
+// ═══════════════════════════════════════════════════════════
+// Stores entire inbox as a single blob (max ~1.6KB for 20 messages).
+// Written after every msgPush(); loaded once at boot.
+
+void msgSave() {
+  prefs.begin("crows", false);
+  prefs.putInt("msgCount", msgCount);
+  if (msgCount > 0) {
+    size_t sz = sizeof(CrowSMsg) * msgCount;
+    prefs.putBytes("msgInbox", msgInbox, sz);
+    Serial.printf("[NVS] Saved %d messages (%d bytes)\n", msgCount, sz);
+  } else {
+    prefs.remove("msgInbox");
+    Serial.println("[NVS] Inbox cleared");
+  }
+  prefs.end();
+}
+
+void msgLoad() {
+  prefs.begin("crows", true);
+  msgCount = prefs.getInt("msgCount", 0);
+  if (msgCount > MSG_MAX) msgCount = MSG_MAX;
+  if (msgCount < 0)       msgCount = 0;
+  if (msgCount > 0) {
+    size_t expected = sizeof(CrowSMsg) * msgCount;
+    size_t actual = prefs.getBytes("msgInbox", msgInbox, expected);
+    if (actual != expected) {
+      Serial.printf("[NVS] Inbox size mismatch (%d vs %d), clearing\n", actual, expected);
+      msgCount = 0;
+      memset(msgInbox, 0, sizeof(msgInbox));
+    } else {
+      Serial.printf("[NVS] Loaded %d messages\n", msgCount);
+    }
+  }
+  prefs.end();
+}
+
+void msgClearAll() {
+  msgCount = 0;
+  memset(msgInbox, 0, sizeof(msgInbox));
+  prefs.begin("crows", false);
+  prefs.remove("msgCount");
+  prefs.remove("msgInbox");
+  prefs.end();
+  Serial.println("[NVS] All messages erased");
+}
+
+// ═══════════════════════════════════════════════════════════
+//  EMERGENCY CLEAR — hold X 7s on top menu to wipe device
+// ═══════════════════════════════════════════════════════════
+#define EMERGENCY_HOLD_MS 7000
+unsigned long holdStart_back = 0;
+
+// Forward declarations — wizard vars defined later in T9 section
+extern char wizardBuf[16];
+extern int  wizardCursor;
+extern int  t9_lastKey;
+extern int  t9_tapCount;
+
+void emergencyClear() {
+  Serial.println("[EMERGENCY] === DEVICE WIPE ===");
+  msgClearAll();
+  identitySave("");
+  userName[0] = '\0';
+
+  // Visual confirmation — flash red
+  canvas->clear(COL_BG);
+  canvas->setTextSize(2);
+  canvas->setTextColor(TFT_RED);
+  canvas->setCursor(20, 40);
+  canvas->print("DEVICE");
+  canvas->setCursor(20, 64);
+  canvas->print("WIPED");
+  display->commit();
+  delay(1500);
+
+  // Deactivate panic if active
+  if (panicActive) {
+    panicActive = false;
+    colTheme = COL_PURPLE;
+    backlightSet(100);
+  }
+
+  // Enter wizard
+  osState = STATE_WIZARD;
+  memset(wizardBuf, 0, sizeof(wizardBuf));
+  wizardCursor = 0;
+  t9_lastKey = -1;
+  t9_tapCount = 0;
+  drawWizard();
+}
+
+void drawEmergencyHoldProgress() {
+  if (holdStart_back == 0) return;
+  unsigned long elapsed = millis() - holdStart_back;
+  int barW = (int)((elapsed * (SCREEN_W - 20)) / EMERGENCY_HOLD_MS);
+  if (barW > SCREEN_W - 20) barW = SCREEN_W - 20;
+
+  canvas->fillRect(10, SCREEN_H - 8, SCREEN_W - 20, 5, COL_DIVIDER);
+  canvas->fillRect(10, SCREEN_H - 8, barW, 5, TFT_RED);
+  canvas->setTextSize(1);
+  canvas->setTextColor(TFT_RED);
+  canvas->setCursor(10, SCREEN_H - 18);
+  canvas->print("Hold X to WIPE...");
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2312,7 +2435,8 @@ void settings_button(uint8_t id) {
     settings_draw();
   }
   if (id == BTN_ENTER && settingsSel == 1) {
-    // Clear name and go to wizard
+    // Clear name and messages, go to wizard
+    msgClearAll();
     identitySave("");
     userName[0] = '\0';
     if (activeApp) activeApp->onStop();
@@ -2711,6 +2835,7 @@ void setup() {
   // Check for saved name — first run goes to wizard
   if (identityExists()) {
     identityLoad();
+    msgLoad();
     Serial.printf("Name: %s\n", userName);
     drawMenu();
   } else {
@@ -2806,13 +2931,32 @@ void loop() {
       holdStart_9 = 0;
     }
 
+    // BTN_BACK (X): hold 7s on top-level menu to EMERGENCY CLEAR
+    bool backHeld = !(cur & (1 << BTN_BACK));
+    if (backHeld && osState == STATE_MENU && menuLevel == 0) {
+      if (holdStart_back == 0) holdStart_back = millis();
+      if (millis() - holdStart_back >= EMERGENCY_HOLD_MS) {
+        holdStart_back = 0;
+        emergencyClear();
+        return;  // skip rest of loop — we're in wizard now
+      }
+    } else {
+      if (holdStart_back > 0) {
+        holdStart_back = 0;
+        if (osState == STATE_MENU) drawMenu();
+        else needsRedraw = true;
+      }
+      holdStart_back = 0;
+    }
+
     // ── Edge-triggered button handling ──
     for (int i = 0; i < 16; i++) {
       if (!(pressed & (1 << i))) continue;
 
-      // Suppress edge events for keys being held for panic
+      // Suppress edge events for keys being held
       if (i == BTN_STAR && holdStart_star > 0) continue;
       if (i == BTN_9    && holdStart_9 > 0)    continue;
+      if (i == BTN_BACK && holdStart_back > 0)  continue;
 
       if (osState == STATE_MENU) {
         if (menuLevel == 0) {
@@ -2895,10 +3039,12 @@ void loop() {
   }
 
   // ── Background beacon broadcast (runs in ALL states) ──
-  // Every CrowS device is always discoverable by Shine Finder
-  if (loraReady) {
+  // Suppressed during Panic Mode (panic beacons replace SHINE)
+  // Suppressed briefly after chat TX (chat priority)
+  if (loraReady && !panicActive) {
     unsigned long now = millis();
-    if (now - shineLastTx >= SHINE_BEACON_MS + (unsigned long)(random(1000))) {
+    bool chatWindow = (now - loraLastChatTx < LORA_CHAT_PRIORITY_MS);
+    if (!chatWindow && now - shineLastTx >= SHINE_BEACON_MS + (unsigned long)(random(1000))) {
       shineLastTx = now;
       shineSendBeacon();
     }
@@ -2923,6 +3069,10 @@ void loop() {
     if (millis() - panicActivateTime >= PANIC_HINT_DELAY) {
       panicDrawHoldProgress(BTN_9);
     }
+    needsRedraw = true;
+  }
+  if (holdStart_back > 0) {
+    drawEmergencyHoldProgress();
     needsRedraw = true;
   }
 
