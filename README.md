@@ -1,6 +1,6 @@
 # CrowS — Chatter Redesigned OS with Substance
 
- <img alt="CrowS" src="docs/feather.png" />
+ <img alt="CrowS" src="docs/featherS.png" />
 
 
 A custom FOSS operating system for the [CircuitMess Chatter 2.0](https://circuitmess.com/pages/chatter-2-0/) hardware. CrowS replaces the stock firmware entirely with a from-scratch OS: app launcher, games, utilities, and **real end-to-end encrypted LoRa messaging**.
