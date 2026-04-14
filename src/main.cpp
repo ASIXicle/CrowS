@@ -1,6 +1,6 @@
 /*
  * CrowS — Chatter Redesigned OS with Substance
- * v0.6.0: Monocypher crypto (X25519 keypair), WiFi/BT disabled
+ * v0.7.0: Monocypher crypto (X25519 keypair), WiFi/BT disabled
  *
  * Target:  CircuitMess Chatter 2.0
  *          ESP32-D0WD, ST7735S 160x128 TFT, 74HC165 shift register input
@@ -26,7 +26,7 @@
 #include <monocypher.h>
 #include <esp_bt.h>
 
-#define CROWS_VERSION "0.6.0"
+#define CROWS_VERSION "0.7.0"
 
 // ═══════════════════════════════════════════════════════════
 //  DISPLAY
@@ -273,7 +273,14 @@ struct PeerKey {
 
 PeerKey peers[PEER_MAX];
 int     peerCount = 0;
+int msgSelectedPeerIdx = -1;
+int peerSelectCursor   = 0;
 unsigned long kexLastTx = 0;
+// Manual beacon burst — triggered from Settings > Send Beacon
+bool    kexBurstActive = false;
+unsigned long kexBurstStart = 0;
+#define KEX_BURST_DURATION_MS 35000   // 35 seconds
+#define KEX_BURST_INTERVAL_MS 6000    // every 6 seconds during burst
 
 PeerKey* peerLookup(const char* name);
 static size_t b64_decode(uint8_t* out, const char* in, size_t inLen);
@@ -297,6 +304,16 @@ bool loraReceive() {
   if (state != RADIOLIB_ERR_NONE) {
     Serial.printf("[LoRa] RX error (code %d)\n", state);
     return false;
+  }
+
+// Universal self-filter: drop our own echoed packets silently
+  {
+    String selfPrefix1 = String("KEX:") + userName + ":";
+    String selfPrefix2 = String("ECROWS:") + userName + ":";
+    String selfPrefix3 = String("CROWS:") + userName + ":";
+    if (raw.startsWith(selfPrefix1) || raw.startsWith(selfPrefix2) || raw.startsWith(selfPrefix3)) {
+      return false;
+    }
   }
 
   Serial.printf("[LoRa] RX: %s (RSSI %.1f, SNR %.1f)\n",
@@ -796,7 +813,7 @@ static size_t b64_decode(uint8_t* out, const char* in, size_t inLen) {
 // Stores up to PEER_MAX peers' public keys + precomputed shared keys.
 // Peers discovered via KEX: packets, persisted in NVS.
 
-#define KEX_BEACON_MS 30000  // broadcast own pubkey every 30s
+#define KEX_BEACON_MS 300000  // broadcast own pubkey every 5 minutes
 #define PEER_STALE_MS 180000 // 3 min — prune peers with no KEX
 #define KEX_MIN_SNR   -5.0f  // reject KEX below this SNR (likely corrupted)
 #define TOFU_CONFIRM   2     // consecutive clean KEX required for key change
@@ -1030,11 +1047,17 @@ bool kexHandlePacket(const String& raw, float snr) {
 bool loraSendEncrypted(const char* text) {
   if (!loraReady || !text[0]) return false;
 
-  // Find most recently active peer with a shared key
+// Use the selected peer if set, otherwise fall back to most recent
   PeerKey* peer = NULL;
-  for (int i = 0; i < peerCount; i++) {
-    if (peers[i].hasSharedKey) {
-      if (!peer || peers[i].lastKex > peer->lastKex) peer = &peers[i];
+  if (msgSelectedPeerIdx >= 0 && msgSelectedPeerIdx < peerCount
+      && peers[msgSelectedPeerIdx].hasSharedKey) {
+    peer = &peers[msgSelectedPeerIdx];
+  } else {
+    // Fallback: find most recently active peer with a shared key
+    for (int i = 0; i < peerCount; i++) {
+      if (peers[i].hasSharedKey) {
+        if (!peer || peers[i].lastKex > peer->lastKex) peer = &peers[i];
+      }
     }
   }
   if (!peer) {
@@ -2409,8 +2432,16 @@ void magOnStop() {
  * Background receive runs in loop() regardless of active app.
  */
 
-enum MsgView { MSG_INBOX, MSG_COMPOSE };
+// Message view states:
+//   MSG_INBOX       — scrollable message list
+//   MSG_PEER_SELECT — choose recipient before composing
+//   MSG_COMPOSE     — T9 text input + send
+enum MsgView { MSG_INBOX, MSG_PEER_SELECT, MSG_COMPOSE };
 MsgView  msgView = MSG_INBOX;
+
+// Recipient selection — index into peers[] array
+// -1 = no encrypted peer available (plaintext fallback)
+
 int      msgScroll = 0;       // inbox scroll position (index of topmost visible msg)
 #define  MSG_VISIBLE 3        // messages visible in inbox (30px each)
 #define  MSG_LINE_W  25       // chars per wrapped line (25×6 = 150px + margins)
@@ -2541,6 +2572,89 @@ void msg_drawInbox() {
   needsRedraw = true;
 }
 
+// ── Peer selection screen ──
+// Shows all peers with shared encryption keys.
+// User scrolls with UP/DOWN, selects with ENTER, cancels with BACK.
+void msg_drawPeerSelect() {
+  canvas->clear(COL_BG);
+
+  // Header
+  canvas->fillRect(0, 0, SCREEN_W, 14, colTheme);
+  canvas->setTextSize(1);
+  canvas->setTextColor(TFT_WHITE);
+  canvas->setCursor(5, 3);
+  canvas->print("SELECT RECIPIENT");
+
+  // Build list of peers with shared keys
+  int validPeers[PEER_MAX];
+  int validCount = 0;
+  for (int i = 0; i < peerCount; i++) {
+    if (peers[i].hasSharedKey) {
+      validPeers[validCount++] = i;
+    }
+  }
+
+  if (validCount == 0) {
+    // No encrypted peers — shouldn't reach here (handled in button logic)
+    canvas->setTextColor(COL_HINT);
+    canvas->setCursor(10, 50);
+    canvas->print("No peers found");
+    canvas->setCursor(10, 66);
+    canvas->print("Waiting for KEX...");
+    needsRedraw = true;
+    return;
+  }
+
+  // Clamp cursor
+  if (peerSelectCursor >= validCount) peerSelectCursor = validCount - 1;
+  if (peerSelectCursor < 0) peerSelectCursor = 0;
+
+  // Draw peer list (up to 5 visible rows)
+  int maxVisible = 5;
+  int startIdx = 0;
+  if (peerSelectCursor >= maxVisible) startIdx = peerSelectCursor - maxVisible + 1;
+
+  for (int i = 0; i < maxVisible && (startIdx + i) < validCount; i++) {
+    int pIdx = validPeers[startIdx + i];
+    int row_y = 20 + i * 18;
+    bool selected = ((startIdx + i) == peerSelectCursor);
+
+    // Highlight selected row
+    if (selected) {
+      canvas->fillRect(0, row_y - 1, SCREEN_W, 17, colTheme);
+      canvas->setTextColor(TFT_WHITE);
+    } else {
+      canvas->setTextColor(COL_PEER);
+    }
+
+    // Peer name
+    canvas->setCursor(8, row_y + 2);
+    canvas->print(peers[pIdx].name);
+
+    // Lock icon (has shared key — always true here, but visual indicator)
+    canvas->setCursor(SCREEN_W - 18, row_y + 2);
+    canvas->print("\x07");  // bell char as lock stand-in (small dot)
+  }
+
+  // Scroll indicators
+  canvas->setTextColor(COL_HINT);
+  if (startIdx > 0) {
+    canvas->setCursor(150, 20);
+    canvas->print("^");
+  }
+  if (startIdx + maxVisible < validCount) {
+    canvas->setCursor(150, 20 + (maxVisible - 1) * 18);
+    canvas->print("v");
+  }
+
+  // Help text
+  canvas->setTextColor(COL_HINT);
+  canvas->setCursor(8, 112);
+  canvas->print("ENTER:select  BACK:cancel");
+
+  needsRedraw = true;
+}
+
 // ── Compose drawing ──
 void msg_drawCompose() {
   canvas->clear(COL_BG);
@@ -2550,7 +2664,35 @@ void msg_drawCompose() {
   canvas->setTextSize(1);
   canvas->setTextColor(TFT_WHITE);
   canvas->setCursor(5, 3);
-  canvas->print("COMPOSE");
+  // Show recipient + lock icon, or COMPOSE for plaintext
+  if (msgSelectedPeerIdx >= 0 && msgSelectedPeerIdx < peerCount) {
+    canvas->print("TO:");
+    canvas->setCursor(23, 3);
+    canvas->print(peers[msgSelectedPeerIdx].name);
+    // 8-bit pixel art padlock (5x7) — green border, purple fill, green keyhole
+    // Bitmap: 0=transparent, 1=green(border), 2=purple(fill)
+    static const uint8_t lockIcon[7][5] = {
+      {0,1,1,1,0},  // shackle top
+      {1,0,0,0,1},  // shackle sides
+      {1,1,1,1,1},  // body top edge
+      {1,2,2,2,1},  // body purple fill
+      {1,2,1,2,1},  // keyhole (green center dot)
+      {1,2,2,2,1},  // body purple fill
+      {1,1,1,1,1},  // body bottom edge
+    };
+    int lx = 23 + strlen(peers[msgSelectedPeerIdx].name) * 6 + 4;
+    int ly = 3;  // align with text baseline
+    for (int row = 0; row < 7; row++) {
+      for (int col = 0; col < 5; col++) {
+        if (lockIcon[row][col] == 1)
+          canvas->drawPixel(lx + col, ly + row, TFT_GREEN);
+        else if (lockIcon[row][col] == 2)
+          canvas->drawPixel(lx + col, ly + row, COL_PURPLE);
+      }
+    }
+  } else {
+    canvas->print("COMPOSE");
+  }
 
   // Character count
   char countBuf[8];
@@ -2623,8 +2765,69 @@ void msg_button(uint8_t id) {
       case BTN_DOWN:
         if (msgScroll + MSG_VISIBLE < msgCount) { msgScroll++; msg_drawInbox(); }
         break;
-      case BTN_ENTER:
-        // Switch to compose
+case BTN_ENTER: {
+        // Count peers with shared keys
+        int encPeers = 0;
+        int lastEncIdx = -1;
+        for (int i = 0; i < peerCount; i++) {
+          if (peers[i].hasSharedKey) { encPeers++; lastEncIdx = i; }
+        }
+
+        if (encPeers == 0) {
+          // No encrypted peers — go straight to compose (plaintext)
+          msgSelectedPeerIdx = -1;
+          msgView = MSG_COMPOSE;
+          memset(msgComposeBuf, 0, sizeof(msgComposeBuf));
+          msgComposeCursor = 0;
+          t9_lastKey = -1;
+          t9_tapCount = 0;
+          msg_drawCompose();
+        } else if (encPeers == 1) {
+          // Only one peer — auto-select, skip peer list
+          msgSelectedPeerIdx = lastEncIdx;
+          msgView = MSG_COMPOSE;
+          memset(msgComposeBuf, 0, sizeof(msgComposeBuf));
+          msgComposeCursor = 0;
+          t9_lastKey = -1;
+          t9_tapCount = 0;
+          msg_drawCompose();
+        } else {
+          // Multiple peers — show selection screen
+          peerSelectCursor = 0;
+          msgView = MSG_PEER_SELECT;
+          msg_drawPeerSelect();
+        }
+        break;
+      }
+    }
+
+  } else if (msgView == MSG_PEER_SELECT) {
+    switch (id) {
+      case BTN_UP:
+        if (peerSelectCursor > 0) { peerSelectCursor--; msg_drawPeerSelect(); }
+        break;
+      case BTN_DOWN: {
+        // Count valid peers to check bounds
+        int validCount = 0;
+        for (int i = 0; i < peerCount; i++) {
+          if (peers[i].hasSharedKey) validCount++;
+        }
+        if (peerSelectCursor < validCount - 1) { peerSelectCursor++; msg_drawPeerSelect(); }
+        break;
+      }
+      case BTN_ENTER: {
+        // Find the peer at cursor position
+        int count = 0;
+        for (int i = 0; i < peerCount; i++) {
+          if (peers[i].hasSharedKey) {
+            if (count == peerSelectCursor) {
+              msgSelectedPeerIdx = i;
+              break;
+            }
+            count++;
+          }
+        }
+        // Transition to compose
         msgView = MSG_COMPOSE;
         memset(msgComposeBuf, 0, sizeof(msgComposeBuf));
         msgComposeCursor = 0;
@@ -2632,7 +2835,14 @@ void msg_button(uint8_t id) {
         t9_tapCount = 0;
         msg_drawCompose();
         break;
+      }
+      case BTN_BACK:
+        // Cancel — return to inbox
+        msgView = MSG_INBOX;
+        msg_drawInbox();
+        break;
     }
+
   } else if (msgView == MSG_COMPOSE) {
     // T9 input
     int key = t9_keyFromButton(id);
@@ -2691,6 +2901,12 @@ void msg_button(uint8_t id) {
 }
 
 bool msg_back() {
+  if (msgView == MSG_PEER_SELECT) {
+    // Cancel peer selection → return to inbox
+    msgView = MSG_INBOX;
+    msg_drawInbox();
+    return false;
+  }
   if (msgView == MSG_COMPOSE) {
     // Backspace
     if (msgComposeCursor > 0) {
@@ -2906,7 +3122,7 @@ void shine_stop() {
 // ═══════════════════════════════════════════════════════════
 unsigned long settingsLastRefresh = 0;
 #define SETTINGS_REFRESH_MS 1000
-int settingsSel = 0;  // 0 = info view, 1 = Reset Name highlighted
+// Settings is info-only — actions in separate System menu items
 
 void settings_draw() {
   canvas->clear(COL_BG);
@@ -2976,18 +3192,6 @@ void settings_draw() {
   canvas->setCursor(valX, y);
   snprintf(buf, sizeof(buf), "%d MHz", ESP.getCpuFreqMHz());
   canvas->print(buf);
-
-  // Reset Name action
-  y += 18;
-  if (settingsSel == 1) {
-    canvas->fillRect(labelX, y - 2, SCREEN_W - labelX * 2, 14, TFT_RED);
-    canvas->setTextColor(TFT_WHITE);
-  } else {
-    canvas->setTextColor(COL_HINT);
-  }
-  canvas->setCursor(labelX + 4, y);
-  canvas->print("Reset Name");
-
   canvas->setTextColor(COL_HINT);
   canvas->setCursor(20, 116);
   canvas->print("UP/DN  ENTER  BACK");
@@ -2995,7 +3199,7 @@ void settings_draw() {
   needsRedraw = true;
 }
 
-void settings_start() { settingsLastRefresh = 0; settingsSel = 0; }
+void settings_start() { settingsLastRefresh = 0; }
 
 void settings_tick() {
   if (millis() - settingsLastRefresh >= SETTINGS_REFRESH_MS) {
@@ -3005,25 +3209,8 @@ void settings_tick() {
 }
 
 void settings_button(uint8_t id) {
-  if (id == BTN_UP || id == BTN_DOWN) {
-    settingsSel = settingsSel ? 0 : 1;
-    settings_draw();
-  }
-  if (id == BTN_ENTER && settingsSel == 1) {
-    // Clear name and messages, go to wizard
-    msgClearAll();
-    cryptoWipeKeys();
-    identitySave("");
-    userName[0] = '\0';
-    if (activeApp) activeApp->onStop();
-    activeApp = NULL;
-    osState = STATE_WIZARD;
-    memset(wizardBuf, 0, sizeof(wizardBuf));
-    wizardCursor = 0;
-    t9_lastKey = -1;
-    t9_tapCount = 0;
-    drawWizard();
-  }
+  // Settings is now info-only — Send Beacon and Reset moved to System menu
+  (void)id;
 }
 bool settings_back() { return true; }
 void settings_stop() { }
@@ -3045,8 +3232,135 @@ CrowSApp messagingApps[] = {
   { "Messages",       TFT_GREEN,  msg_start,      msg_tick,      msg_button,      msg_back,      msg_stop      },
 };
 
+// ── Send Beacon (quick-action app) ──
+// Activates KEX burst and shows countdown, auto-exits when done
+void beacon_draw() {
+  canvas->clear(COL_BG);
+  canvas->fillRect(0, 0, SCREEN_W, 14, colTheme);
+  canvas->setTextSize(1);
+  canvas->setTextColor(TFT_WHITE);
+  canvas->setCursor(5, 3);
+  canvas->print("SEND BEACON");
+
+  if (kexBurstActive) {
+    unsigned long elapsed = millis() - kexBurstStart;
+    unsigned long remaining = (KEX_BURST_DURATION_MS > elapsed)
+                              ? (KEX_BURST_DURATION_MS - elapsed) / 1000 : 0;
+
+    // Progress bar
+    int barW = (int)(elapsed * (SCREEN_W - 20) / KEX_BURST_DURATION_MS);
+    if (barW > SCREEN_W - 20) barW = SCREEN_W - 20;
+    canvas->drawRect(10, 40, SCREEN_W - 20, 12, COL_HINT);
+    canvas->fillRect(10, 40, barW, 12, TFT_GREEN);
+
+    // Countdown
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%lus remaining", remaining);
+    canvas->setTextColor(TFT_GREEN);
+    canvas->setCursor(40, 60);
+    canvas->print(buf);
+
+    canvas->setTextColor(COL_HINT);
+    canvas->setCursor(20, 80);
+    canvas->print("Broadcasting KEX...");
+  } else {
+    canvas->setTextColor(TFT_GREEN);
+    canvas->setCursor(30, 50);
+    canvas->print("Beacon complete");
+  }
+
+  canvas->setTextColor(COL_HINT);
+  canvas->setCursor(30, 112);
+  canvas->print("BACK: return");
+  needsRedraw = true;
+}
+
+void beacon_start() {
+  kexBurstActive = true;
+  kexBurstStart = millis();
+  kexLastTx = 0;  // force immediate first beacon
+  Serial.println("[KEX] Manual beacon burst started");
+  // Confirmation chirp
+  ledcWriteTone(0, 1500); delay(60);
+  ledcWriteTone(0, 2000); delay(60);
+  ledcWriteTone(0, 0);
+  beacon_draw();
+}
+
+void beacon_tick() {
+  static unsigned long lastDraw = 0;
+  if (millis() - lastDraw >= 500) {
+    lastDraw = millis();
+    beacon_draw();
+  }
+}
+
+void beacon_button(uint8_t id) { (void)id; }
+bool beacon_back() { return true; }  // exit to menu
+void beacon_stop() { }               // burst continues in background
+
+// ── Reset Name (confirmation app) ──
+bool resetConfirm = false;
+
+void reset_draw() {
+  canvas->clear(COL_BG);
+  canvas->fillRect(0, 0, SCREEN_W, 14, TFT_RED);
+  canvas->setTextSize(1);
+  canvas->setTextColor(TFT_WHITE);
+  canvas->setCursor(5, 3);
+  canvas->print("RESET DEVICE");
+
+  if (!resetConfirm) {
+    canvas->setTextColor(TFT_YELLOW);
+    canvas->setCursor(10, 30);
+    canvas->print("This will erase:");
+    canvas->setTextColor(TFT_WHITE);
+    canvas->setCursor(10, 46);
+    canvas->print("- Your name");
+    canvas->setCursor(10, 58);
+    canvas->print("- All messages");
+    canvas->setCursor(10, 70);
+    canvas->print("- All encryption keys");
+
+    canvas->setTextColor(TFT_RED);
+    canvas->setCursor(10, 92);
+    canvas->print("ENTER: confirm");
+    canvas->setTextColor(COL_HINT);
+    canvas->setCursor(10, 104);
+    canvas->print("BACK:  cancel");
+  }
+
+  needsRedraw = true;
+}
+
+void reset_start() { resetConfirm = false; reset_draw(); }
+void reset_tick() { }
+
+void reset_button(uint8_t id) {
+  if (id == BTN_ENTER && !resetConfirm) {
+    resetConfirm = true;
+    msgClearAll();
+    cryptoWipeKeys();
+    identitySave("");
+    userName[0] = '\0';
+    if (activeApp) activeApp->onStop();
+    activeApp = NULL;
+    osState = STATE_WIZARD;
+    memset(wizardBuf, 0, sizeof(wizardBuf));
+    wizardCursor = 0;
+    t9_lastKey = -1;
+    t9_tapCount = 0;
+    drawWizard();
+  }
+}
+
+bool reset_back() { return true; }  // cancel, return to menu
+void reset_stop() { }
+
 CrowSApp systemApps[] = {
   { "Settings",       TFT_YELLOW, settings_start, settings_tick, settings_button, settings_back, settings_stop },
+  { "Send Beacon",    TFT_GREEN,  beacon_start,   beacon_tick,   beacon_button,   beacon_back,   beacon_stop   },
+  { "Reset Device",   TFT_RED,    reset_start,    reset_tick,    reset_button,    reset_back,    reset_stop    },
 };
 
 #define CAT_COUNT 4
@@ -3054,7 +3368,7 @@ CrowSCategory categories[CAT_COUNT] = {
   { "Games",     TFT_CYAN,    gamesApps,     1 },
   { "Apps",      TFT_GREEN,   appsApps,      2 },
   { "Messaging", TFT_MAGENTA, messagingApps, 1 },
-  { "System",    TFT_YELLOW,  systemApps,    1 },
+  { "System",    TFT_YELLOW,  systemApps,    3 },
 };
 
 // ═══════════════════════════════════════════════════════════
@@ -3649,7 +3963,15 @@ void loop() {
     unsigned long now = millis();
     bool chatWindow = (now - loraLastChatTx < LORA_CHAT_PRIORITY_MS);
     // KEX beacon: broadcast public key every 30s (separate from SHINE)
-    if (!chatWindow && cryptoReady && now - kexLastTx >= KEX_BEACON_MS + (unsigned long)(random(2000))) {
+    // Expire burst mode after 90s
+    if (kexBurstActive && now - kexBurstStart >= KEX_BURST_DURATION_MS) {
+      kexBurstActive = false;
+      Serial.println("[KEX] Beacon burst ended");
+    }
+
+    // Use burst interval (6s) or normal interval (5min)
+    unsigned long interval = kexBurstActive ? KEX_BURST_INTERVAL_MS : KEX_BEACON_MS;
+    if (!chatWindow && cryptoReady && now - kexLastTx >= interval + (unsigned long)(random(2000))) {
       kexLastTx = now;
       kexSendBeacon();
     }
